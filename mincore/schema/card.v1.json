@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/dolmudaddy/minerals-core/schema/card.v1.json",
+  "title": "CMW·KCMO 통일 카드 (card.v1)",
+  "description": "수집~카드 생성 단계의 공통 형식. 본문 전문은 절대 포함하지 않는다(길이·sha256·인용 구절만). summary/provenance는 요약 단계에서 채운다.",
+  "type": "object",
+  "required": ["schema_version", "service", "card_id", "title", "title_norm", "url", "source",
+               "published", "collected_at", "score", "body", "summary", "provenance", "ext"],
+  "properties": {
+    "schema_version": {"const": "card.v1"},
+    "service": {"enum": ["kcmo", "cmw"]},
+    "card_id": {"type": "string", "pattern": "^[0-9a-f]{12}$", "description": "sha1(canonical url) 앞 12자리"},
+    "title": {"type": "string"},
+    "title_norm": {"type": "string", "description": "NFKC·소문자·매체명 꼬리·구두점 제거"},
+    "url": {"type": "string", "description": "원매체 canonical URL"},
+    "gnews_url": {"type": ["string", "null"]},
+    "source": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string"},
+        "domain": {"type": "string"},
+        "tier": {"type": ["string", "null"]},
+        "tier_weight": {"type": ["number", "null"]},
+        "language": {"type": ["string", "null"]}
+      }
+    },
+    "published": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+    "published_from": {"enum": ["rss", "meta", "gnews", null]},
+    "collected_at": {"type": "string"},
+    "score": {"type": ["number", "null"]},
+    "body": {
+      "type": "object",
+      "required": ["status", "chars", "sha256", "source", "block_type", "http_status", "extracted_date", "quotes"],
+      "properties": {
+        "status": {"enum": ["full", "partial", "lead_only", "title_only"],
+                   "description": "full ≥800자 / partial 300~799 / lead_only 1~299 / title_only 0"},
+        "chars": {"type": "integer"},
+        "sha256": {"type": ["string", "null"]},
+        "source": {"enum": ["trafilatura", "amp", "feed", "presscorner_api", "og_description", "rss_summary", "none"]},
+        "block_type": {"enum": ["timeout", "bot_block", "paywall", "http_error", "parse_fail", "skipped", null],
+                       "description": "1차 요청의 차단 유형. 대체 전략으로 회복해도 남는다"},
+        "http_status": {"type": ["integer", "null"]},
+        "extracted_date": {"type": ["string", "null"]},
+        "quotes": {"type": "array", "maxItems": 2, "items": {"type": "string", "maxLength": 220},
+                   "description": "우선순위 ① 숫자·단위 ② 따옴표 인용 ③ 광물·기관 키워드. 합계 300자 이하"},
+        "final_url": {"type": ["string", "null"]},
+        "strategies_tried": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "summary_input_max_chars": {"const": 4000,
+                                "description": "요약 입력 본문 최대 길이(앞부분 우선). 다음 단계에서 구현"},
+    "summary": {"type": ["object", "null"],
+                "description": "다음 단계. body.status가 lead_only·title_only면 3줄 요약·시사점 생성 금지"},
+    "provenance": {
+      "type": ["object", "null"],
+      "properties": {
+        "input_body_status": {"type": "string"},
+        "model": {"type": "string"},
+        "prompt_sha256": {"type": "string"},
+        "summarized_at": {"type": "string"}
+      }
+    },
+    "ext": {
+      "type": "object",
+      "description": "서비스별 확장 필드",
+      "properties": {
+        "kcmo": {"type": "object", "description": "country, source_type, search_query, priority_boost …"},
+        "cmw": {"type": "object"}
+      }
+    }
+  }
+}
