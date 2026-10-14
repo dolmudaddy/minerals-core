@@ -97,7 +97,7 @@ def render_md(d: dict) -> str:
          f"| 수집 기사 | {c.get('fetched', '-')} |",
          f"| 필터 통과 | {c.get('qualified', '-')} |",
          f"| 원장 제외 | {sum(d['ledger_excluded'].values())} {dict(d['ledger_excluded']) or ''} |",
-         f"| 회차 내 중복 제거 | {c.get('dedup_dropped', 0)} |",
+         f"| 회차 내 중복 (원매체 주소 기준) | {c.get('dedup_dropped', 0)} |",
          f"| 최종 기사 | {n} |",
          f"| GN 주소 변환 성공률 | {gn_ok}/{gn} ({_pct(gn_ok, gn)}) |",
          f"| **본문 확보율** (full+partial) | **{got}/{n} ({_pct(got, n)})** |"]
