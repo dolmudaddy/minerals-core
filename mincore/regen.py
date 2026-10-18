@@ -31,6 +31,13 @@ from .summarize import DEFAULT_MODEL, Prompt, load_prompt, summarize_card, to_le
 
 # 서비스별 v1 파일 규칙
 PATTERNS = {"kcmo": "cards_*.json", "cmw": "week-*.json"}
+# 회차의 GN 주소 해석 실패가 이 비율을 넘으면 저장하지 않고 중단한다(일시 차단 → 제목 기반 카드 양산 방지).
+# --resume으로 다시 돌리면 그 회차부터 이어진다.
+RESOLVE_FAIL_MAX = 0.5
+
+
+class ResolveOutage(RuntimeError):
+    pass
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
 
 
@@ -116,6 +123,13 @@ class Regen:
 
     def process_issue(self, week: str, items: list[dict]) -> dict:
         resolutions = self.resolver([it["url"] for it in items])
+        gn = [r for it, r in zip(items, resolutions) if is_gnews(it["url"])]
+        failed = [r for r in gn if not r.url]
+        if failed:
+            self.log(f"[regen] GN 주소 해석 실패 {len(failed)}/{len(gn)}: "
+                     f"{dict(Counter((r.error or '')[:80] for r in failed).most_common(3))}")
+        if gn and len(failed) / len(gn) > RESOLVE_FAIL_MAX:
+            raise ResolveOutage(f"{week}: GN 해석 실패 {len(failed)}/{len(gn)} > {RESOLVE_FAIL_MAX:.0%}")
         ctx: dict = {}
         cards, excluded = [], []
         st = {k: Counter() for k in ("body_status", "body_source", "resolve", "fail_reason", "basis")}
@@ -197,7 +211,11 @@ def run(service: str, input_dir: str | Path, out_dir: str | Path, prompt_path: s
             break
         items = load_v1(service, path)
         rg.log(f"\n[regen] {service} {week}: v1 {len(items)}건 ({path.name})")
-        doc = rg.process_issue(week, items)
+        try:
+            doc = rg.process_issue(week, items)
+        except ResolveOutage as e:
+            rg.log(f"[regen][중단] {e} — 이 회차는 저장하지 않음. 잠시 뒤 --resume으로 다시 실행")
+            break
         doc["v1_file"] = path.name
         doc["v1_metrics"] = v1_metrics(service, path)
         target.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
