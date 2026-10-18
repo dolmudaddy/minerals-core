@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mincore"
-version = "0.2.1"
+version = "0.3.0"
 description = "Shared collection core for CMW and KCMO weekly digests: URL resolution, body extraction, cards, ledger, run reports"
 requires-python = ">=3.10"
 dependencies = [
@@ -19,6 +19,8 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+# 요약 단계 (mincore.summarize·regen) — 수집만 쓰는 곳은 설치 불필요
+summarize = ["anthropic>=0.40"]
 
 [tool.setuptools.packages.find]
 include = ["mincore*"]
