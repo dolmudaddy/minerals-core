@@ -1,0 +1,58 @@
+# 도메인별 본문 대체표.
+# 1차 trafilatura가 partial(300자) 미만이거나 차단(401/403/parse_fail)일 때 strategies를 순서대로 시도한다.
+# 모두 실패하면 og:description → rss_summary(Google News/RSS 설명) 순으로 마지막 대체.
+#
+# 키:
+#   strategies   : amp | feed | presscorner_api | og | rss_summary
+#   skip_fetch   : true면 원문 요청 자체를 하지 않음 (어떤 IP에서도 막히는 곳)
+#   min_interval : 이 도메인 요청 간 최소 간격(초). 429 다발 도메인용 (= backoff_long)
+#   amp_templates: amp 전략의 URL 템플릿. {url}=원주소, {base}=끝의 /amp를 뗀 주소
+#   feed_urls    : feed 전략에서 기사 링크를 찾을 RSS 목록
+#   aggregator   : 다른 매체 기사를 모아 싣는 곳 (원출처 우선 검토 대상)
+#   note         : 실측 근거 (2026-10-13 probe)
+#
+# 검색 봇 UA 위장(Googlebot 등)은 쓰지 않는다.
+# 서비스 저장소에서 같은 형식의 YAML로 덮어쓸 수 있다: load_rules(override_path)
+
+domains:
+  cnbcindonesia.com:
+    strategies: [amp, feed, og]
+    amp_templates: ["{url}/amp", "{base}"]
+    feed_urls:
+      - https://www.cnbcindonesia.com/news/rss
+      - https://www.cnbcindonesia.com/market/rss
+    note: "Actions 403 (로컬 200). RSS 설명은 리드 수준"
+
+  cnnindonesia.com:
+    strategies: [amp, feed, og]
+    amp_templates: ["{url}/amp"]
+    feed_urls:
+      - https://www.cnnindonesia.com/ekonomi/rss
+    note: "Actions 403 (로컬 200). /amp 경로 존재 확인"
+
+  suaradewata.com:
+    strategies: [og]
+    note: "Actions 403. /feed·/rss 모두 404"
+
+  finance.biggo.com:
+    strategies: [og]
+    min_interval: 15
+    aggregator: true
+    note: "Actions 429. 원문 재게시 사이트"
+
+  reuters.com:
+    skip_fetch: true
+    strategies: [rss_summary]
+    note: "로컬·Actions 모두 401. 재게시본(지역 방송사)은 통과"
+
+  fastmarkets.com:
+    strategies: [og]
+    note: "200이지만 본문 0 (유료). og:description만 사용"
+
+  projectblue.com:
+    strategies: [og]
+    note: "200이지만 리드만 (유료)"
+
+  ec.europa.eu:
+    strategies: [presscorner_api, og]
+    note: "Press Corner는 JS 렌더링. /presscorner/api/documents?reference=SPEECH/26/1908 JSON에 htmlContent"
