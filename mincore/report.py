@@ -29,6 +29,7 @@ class RunReport:
         self.counts: Counter = Counter()
         self.resolve: Counter = Counter()
         self.ledger_excluded: Counter = Counter()
+        self.ledger_items: list[dict] = []   # {reason, title, url} — 원장 제외 기사 목록
         self.bodies: list[dict] = []      # {domain, status, source, block_type, strategies_tried}
         self.summarize: dict | None = None
 
@@ -45,8 +46,10 @@ class RunReport:
     def resolved(self, method: str):
         self.resolve[method] += 1
 
-    def excluded(self, reason: str):
+    def excluded(self, reason: str, title: str | None = None, url: str | None = None):
         self.ledger_excluded[reason] += 1
+        if title or url:
+            self.ledger_items.append({"reason": reason, "title": title, "url": url})
 
     def body(self, domain: str, rec: dict):
         self.bodies.append({"domain": domain, "status": rec.get("status"), "source": rec.get("source"),
@@ -66,6 +69,7 @@ class RunReport:
             "sources": self.sources,
             "resolve": dict(self.resolve),
             "ledger_excluded": dict(self.ledger_excluded),
+            "ledger_excluded_items": self.ledger_items,
             "body_status": {s: st[s] for s in STATUSES},
             "body_source": dict(Counter(b["source"] for b in self.bodies)),
             "block_type": dict(Counter(b["block_type"] for b in self.bodies if b["block_type"])),
@@ -116,6 +120,11 @@ def render_md(d: dict) -> str:
           f"- 대체 전략 사용: {d['strategy_use'] or '-'}", "",
           "## 도메인별 1차 차단 (상위 20)", "", "| 도메인 | 건수 |", "|---|---:|"]
     L += [f"| {k} | {v} |" for k, v in d["blocked_domains_top20"].items()] or ["| - | 0 |"]
+    items = d.get("ledger_excluded_items") or []
+    if items:
+        L += ["", f"## 원장 제외 목록 ({len(items)}건)", "", "| # | 사유 | 제목 |", "|---:|---|---|"]
+        L += [f"| {i} | {it['reason']} | {(it.get('title') or it.get('url') or '').replace('|', '/')[:120]} |"
+              for i, it in enumerate(items, 1)]
     errs = {k: v for k, v in d["sources"].items() if v.get("error")}
     if errs:
         L += ["", "## 소스 오류", ""] + [f"- {k}: {v['error']}" for k, v in errs.items()]

@@ -20,7 +20,7 @@ CMW(Critical Minerals Weekly)·KCMO(Korea Critical Minerals ODA Weekly) 공통 �
 
 ## 설치
 ```
-pip install "mincore @ git+https://github.com/dolmudaddy/minerals-core@v0.2.0"
+pip install "mincore @ git+https://github.com/dolmudaddy/minerals-core@v0.2.1"
 # 개발
 pip install -e ".[test]" && pytest
 ```
