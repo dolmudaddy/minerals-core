@@ -264,3 +264,16 @@ def test_regen_cmw_reads_week_files(tmp_path, prompt):
     assert items[0]["summary_raw"] == "desc" and items[0]["ext"]["summary_raw"] == "desc"
     assert regen.v1_metrics("cmw", data / "week-2026-10-12.json")["failed"] == 1
     assert [d for d, _ in regen.discover("cmw", data)] == ["2026-10-12"]
+
+
+def test_regen_stops_on_resolve_outage(tmp_path, prompt):
+    data, out = tmp_path / "data", tmp_path / "v2"
+    data.mkdir()
+    write_kcmo_v1(data, "2026-10-11")
+    write_kcmo_v1(data, "2026-10-18")
+    all_fail = lambda urls: [Resolution(u, None, "failed", error="ssl") for u in urls]
+    logs = []
+    done = regen.run("kcmo", data, out, prompt.path, call=lead_or_body_stub, resolver=all_fail,
+                     extractor=fake_extractor, rules=None, cache_dir=tmp_path / "c", log=logs.append)
+    assert done == [] and not (out / "kcmo" / "cards_v2_2026-10-11.json").exists()
+    assert any("중단" in m for m in logs)
