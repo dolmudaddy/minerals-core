@@ -59,7 +59,8 @@ class Fetcher:
             return min(float(ra), MAX_RETRY_AFTER)
         return RETRY_WAITS[min(attempt, len(RETRY_WAITS) - 1)]
 
-    def get(self, url: str, *, min_interval: float | None = None, headers: dict | None = None) -> FetchResult:
+    def get(self, url: str, *, min_interval: float | None = None, headers: dict | None = None,
+            timeout: float | None = None) -> FetchResult:
         domain = domain_of(url)
         interval = max(self.min_interval, min_interval or 0)
         res = FetchResult(url)
@@ -68,7 +69,7 @@ class Fetcher:
             self._wait_turn(domain, interval)
             try:
                 r = self.session.get(url, headers={**HEADERS, **(headers or {})},
-                                     timeout=self.timeout, allow_redirects=True)
+                                     timeout=timeout or self.timeout, allow_redirects=True)
                 res.status, res.final_url, res.text = r.status_code, r.url, r.text or ""
                 res.error = res.error_kind = None
             except requests.Timeout:

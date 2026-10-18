@@ -3,7 +3,8 @@
 # 모두 실패하면 og:description → rss_summary(Google News/RSS 설명) 순으로 마지막 대체.
 #
 # 키:
-#   strategies   : amp | feed | presscorner_api | og | rss_summary
+#   strategies   : amp | feed | presscorner_api | reader_proxy | og | rss_summary
+#                  reader_proxy = Jina Reader(r.jina.ai). 1차 응답 403일 때만, 회차당 20건, 간격 2초 (extract.py 상수)
 #   skip_fetch   : true면 원문 요청 자체를 하지 않음 (어떤 IP에서도 막히는 곳)
 #   min_interval : 이 도메인 요청 간 최소 간격(초). 429 다발 도메인용 (= backoff_long)
 #   amp_templates: amp 전략의 URL 템플릿. {url}=원주소, {base}=끝의 /amp를 뗀 주소
@@ -16,12 +17,12 @@
 
 domains:
   cnbcindonesia.com:
-    strategies: [amp, feed, og]
+    strategies: [amp, feed, reader_proxy, og]
     amp_templates: ["{url}/amp", "{base}"]
     feed_urls:
       - https://www.cnbcindonesia.com/news/rss
       - https://www.cnbcindonesia.com/market/rss
-    note: "Actions 403 (로컬 200). RSS 설명은 리드 수준"
+    note: "Actions 403 (로컬 200). RSS 설명은 리드 수준. Jina 4/6 full (2026-10-18)"
 
   cnnindonesia.com:
     strategies: [amp, feed, og]
@@ -56,3 +57,23 @@ domains:
   ec.europa.eu:
     strategies: [presscorner_api, og]
     note: "Press Corner는 JS 렌더링. /presscorner/api/documents?reference=SPEECH/26/1908 JSON에 htmlContent"
+
+  # ── v0.2.0 (2026-10-18): Actions 1차 차단 + Jina Reader 확보 실측(run 39111120671) 도메인 ──
+  # Jina로도 막힌 곳(cnnindonesia·suaradewata·rri·hallo·rmolsumsel)은 넣지 않는다.
+  # kontan.co.id(CloudFront 403 오류 페이지)·suaralandak.co.id(Cloudflare 오류 페이지)는 probe에서 partial로
+  # 잡혔지만 재확인 결과 오류 문구였음 → 제외.
+  rmol.id:
+    strategies: [reader_proxy, og]
+    note: "Actions bot_block. Jina 2/2 full"
+
+  timesindonesia.co.id:
+    strategies: [reader_proxy, og]
+    note: "Actions bot_block. Jina 2/2 full"
+
+  bataviapos.id:
+    strategies: [reader_proxy, og]
+    note: "Actions bot_block. Jina 1/1 full"
+
+  koran-jakarta.com:
+    strategies: [reader_proxy, og]
+    note: "Actions bot_block. Jina 1/1 full"

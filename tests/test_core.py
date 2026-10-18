@@ -136,7 +136,7 @@ class StubFetcher:
     def __init__(self, mapping):
         self.mapping, self.calls = mapping, []
 
-    def get(self, url, min_interval=None, headers=None):
+    def get(self, url, min_interval=None, headers=None, timeout=None):
         self.calls.append(url)
         status, text = self.mapping.get(url, (404, ""))
         return FetchResult(url, final_url=url, status=status, text=text)
@@ -195,6 +195,48 @@ def test_presscorner_api_strategy():
     payload = json.dumps({"docuLanguageResource": {"htmlContent": "<p>" + "Raw materials matter. " * 40 + "</p>"}})
     res = extract_body(page, StubFetcher({page: (200, "<html><body></body></html>"), api: (200, payload)}), load_rules())
     assert res.source == "presscorner_api" and res.status == "full"
+
+
+READER_RULES = {"blocked.example": {"strategies": ["reader_proxy", "og"]}}
+
+
+def test_reader_proxy_on_403():
+    url = "https://blocked.example/s"
+    f = StubFetcher({url: (403, "Forbidden"), extract.READER_BASE + url: (200, article_html(10))})
+    ctx = {}
+    res = extract_body(url, f, DomainRules(READER_RULES), ctx=ctx)
+    assert res.source == "reader_proxy" and res.status == "full" and res.strategies_tried == ["reader_proxy"]
+    assert "lithium" in res.text and "<p>" not in res.text
+    assert ctx["reader_proxy_used"] == 1
+
+
+def test_reader_proxy_only_for_403():
+    url = "https://blocked.example/s"
+    f = StubFetcher({url: (429, "slow down"), extract.READER_BASE + url: (200, article_html(10))})
+    res = extract_body(url, f, DomainRules(READER_RULES))
+    assert res.source != "reader_proxy" and extract.READER_BASE + url not in f.calls
+
+
+def test_reader_proxy_cap_and_failure_fallback():
+    url = "https://blocked.example/s"
+    f = StubFetcher({url: (403, "Forbidden"), extract.READER_BASE + url: (200, article_html(10))})
+    ctx = {"reader_proxy_used": extract.READER_MAX_PER_RUN}
+    res = extract_body(url, f, DomainRules(READER_RULES), ctx=ctx, title="Nickel smelter news",
+                       rss_summary="Indonesia nickel smelter output rose sharply this quarter, the ministry said today.")
+    assert extract.READER_BASE + url not in f.calls and ctx["reader_proxy_capped"] == 1
+    assert res.source == "rss_summary"
+    # Jina 자체가 차단 페이지를 돌려주면 채택하지 않음
+    f2 = StubFetcher({url: (403, "Forbidden"), extract.READER_BASE + url: (200, "Title: Just a moment...\n" * 50)})
+    res2 = extract_body(url, f2, DomainRules(READER_RULES), ctx={})
+    assert res2.source != "reader_proxy"
+    cf = ("<html><body><h1>403 ERROR</h1><p>The request could not be satisfied. Request blocked. "
+          + "We can't connect to the server for this app or website at this time. " * 8 + "</p></body></html>")
+    f3 = StubFetcher({url: (403, "Forbidden"), extract.READER_BASE + url: (200, cf)})
+    assert extract_body(url, f3, DomainRules(READER_RULES), ctx={}).source != "reader_proxy"
+
+
+def test_reader_proxy_rule_loaded():
+    assert "reader_proxy" in load_rules().for_url("https://www.cnbcindonesia.com/news/x").strategies
 
 
 def test_select_quotes_priority():
@@ -274,6 +316,7 @@ def test_report_write_and_finalize(tmp_path):
     p = rep.write(tmp_path)
     md = p.with_suffix(".md").read_text(encoding="utf-8")
     assert "1/2 (50.0%)" in md and "b.example" in md
+    assert "Reader 프록시 사용 (본문 채택/시도) | 0/0" in md
     raw = tmp_path / "raw.json"
     cards = tmp_path / "cards.json"
     raw.write_text(json.dumps({"articles": [{}, {}, {}]}), encoding="utf-8")
