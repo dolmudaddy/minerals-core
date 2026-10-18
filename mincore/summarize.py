@@ -40,6 +40,8 @@ REFUSAL = re.compile(
     r"죄송|사과드|요약할 수 없|요약이 불가|제공된 (?:정보|내용)만으로는|AI(?:로서| 언어 모델)|"
     r"I cannot|I can't|I'm sorry|I am sorry|As an AI|unable to (?:summari[sz]e|provide)", re.I)
 NUM = re.compile(r"\d[\d.,]*\d|\d")
+# 한국어 큰 수 단위: 원문에 같은 '숫자+단위'가 없으면 환산으로 본다 (예: 618 miliar → 618억, bilioni moja → 10억)
+KR_UNIT = re.compile(r"(\d[\d.,]*)\s*(만|억|조)")
 
 
 # ── 지시문 ────────────────────────────────────────────────────
@@ -181,6 +183,13 @@ def validate_summary(out: dict, mode: str, source_text: str, prompt: Prompt,
     text_out = " ".join(lines + [str(out.get("oda_relevance", ""))])
     if REFUSAL.search(text_out):
         errs.append("거부·사과 문구 포함")
+
+    # 단위 환산: 출력의 '숫자+만/억/조'가 원문에 그대로 없으면 실패 (한국어 원문은 통과)
+    out_all = " ".join(lines + [x for x in figs if isinstance(x, str)] + [str(out.get("oda_relevance", ""))])
+    src_kr = {(re.sub(r"[.,]", "", n), u) for n, u in KR_UNIT.findall(source_text or "")}
+    conv = [f"{n}{u}" for n, u in KR_UNIT.findall(out_all) if (re.sub(r"[.,]", "", n), u) not in src_kr]
+    if conv:
+        errs.append(f"단위 환산 의심(만·억·조로 바꾸지 말고 원문 숫자·단위 그대로): {conv[:3]}")
 
     # 숫자 대조: 출력 숫자(2자리 이상)가 입력에 있어야 함. 발행일의 연·월·일은 허용
     allowed = _num_keys(source_text) | _num_keys((published or "").replace("-", " "))
