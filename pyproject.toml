@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mincore"
-version = "0.2.0"
+version = "0.2.1"
 description = "Shared collection core for CMW and KCMO weekly digests: URL resolution, body extraction, cards, ledger, run reports"
 requires-python = ">=3.10"
 dependencies = [

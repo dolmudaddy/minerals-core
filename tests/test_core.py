@@ -309,7 +309,7 @@ def test_report_write_and_finalize(tmp_path):
     rep.count("qualified", 60)
     rep.resolved("decoder")
     rep.resolved("direct")
-    rep.excluded("url")
+    rep.excluded("url", title="Korea | Uzbekistan sign MoU", url="https://a.example/x")
     rep.body("a.example", {"status": "full", "source": "trafilatura", "block_type": None})
     rep.body("b.example", {"status": "lead_only", "source": "og_description", "block_type": "bot_block",
                            "strategies_tried": ["amp"]})
@@ -317,6 +317,7 @@ def test_report_write_and_finalize(tmp_path):
     md = p.with_suffix(".md").read_text(encoding="utf-8")
     assert "1/2 (50.0%)" in md and "b.example" in md
     assert "Reader 프록시 사용 (본문 채택/시도) | 0/0" in md
+    assert "원장 제외 목록 (1건)" in md and "| 1 | url | Korea / Uzbekistan sign MoU |" in md
     raw = tmp_path / "raw.json"
     cards = tmp_path / "cards.json"
     raw.write_text(json.dumps({"articles": [{}, {}, {}]}), encoding="utf-8")
