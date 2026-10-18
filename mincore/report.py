@@ -71,6 +71,8 @@ class RunReport:
             "block_type": dict(Counter(b["block_type"] for b in self.bodies if b["block_type"])),
             "blocked_domains_top20": dict(blocked.most_common(20)),
             "strategy_use": dict(Counter(s for b in self.bodies for s in b["strategies_tried"])),
+            "reader_proxy": {"tried": sum("reader_proxy" in b["strategies_tried"] for b in self.bodies),
+                             "used": sum(b["source"] == "reader_proxy" for b in self.bodies)},
             "summarize": self.summarize,
         }
 
@@ -90,6 +92,7 @@ def render_md(d: dict) -> str:
     gn = sum(v for k, v in d["resolve"].items() if k != "direct")
     gn_ok = gn - d["resolve"].get("failed", 0)
     c = d["counts"]
+    rp = d.get("reader_proxy") or {}
     L = [f"# 실행 보고 — {d['service'].upper()} {d['run_date']}", "",
          f"생성 {d['generated_at']} · 소요 {d['elapsed_s']}초", "",
          "## 핵심 지표", "",
@@ -100,7 +103,8 @@ def render_md(d: dict) -> str:
          f"| 회차 내 중복 (원매체 주소 기준) | {c.get('dedup_dropped', 0)} |",
          f"| 최종 기사 | {n} |",
          f"| GN 주소 변환 성공률 | {gn_ok}/{gn} ({_pct(gn_ok, gn)}) |",
-         f"| **본문 확보율** (full+partial) | **{got}/{n} ({_pct(got, n)})** |"]
+         f"| **본문 확보율** (full+partial) | **{got}/{n} ({_pct(got, n)})** |",
+         f"| Reader 프록시 사용 (본문 채택/시도) | {rp.get('used', 0)}/{rp.get('tried', 0)} |"]
     if d.get("summarize"):
         s = d["summarize"]
         L.append(f"| 요약 실패 (raw − cards) | {s['failed']} ({s['raw']} → {s['cards']}) |")

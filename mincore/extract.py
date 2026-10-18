@@ -1,6 +1,7 @@
 """원매체 주소 → 본문 상태 기록.
 
 trafilatura(favor_precision) → (300자 미만·차단 시) 도메인 대체표 전략 → og:description → rss_summary.
+reader_proxy(Jina Reader)는 1차 응답이 403인 경우에만, 회차당 READER_MAX_PER_RUN건까지 쓴다.
 본문 전문은 BodyResult.text(메모리)와 선택적 캐시 파일에만 존재하고, to_record()에는 들어가지 않는다.
 """
 
@@ -120,7 +121,7 @@ class BodyResult:
     status: str = "title_only"
     chars: int = 0
     sha256: str | None = None
-    source: str = "none"        # trafilatura | amp | feed | presscorner_api | og_description | rss_summary | none
+    source: str = "none"        # trafilatura | amp | feed | presscorner_api | reader_proxy | og_description | rss_summary | none
     block_type: str | None = None
     http_status: int | None = None
     extracted_date: str | None = None
@@ -190,7 +191,41 @@ def _strategy_presscorner_api(url, fetcher: Fetcher, rule: DomainRule, ctx) -> s
     return clean_html_text(re.sub(r"</p>\s*", "</p>\n", res.get("htmlContent") or ""))
 
 
-STRATEGIES = {"amp": _strategy_amp, "feed": _strategy_feed, "presscorner_api": _strategy_presscorner_api}
+# Jina Reader: 원문이 403인 도메인 한정 대체. 공개 프록시라 예의 규칙을 별도로 둔다.
+READER_BASE = "https://r.jina.ai/"
+READER_MAX_PER_RUN = 20       # 회차당 상한 (ctx["reader_proxy_used"]로 집계 — 회차 내 ctx 공유 필수)
+READER_INTERVAL = 2.0         # r.jina.ai 요청 간 최소 간격(초)
+READER_TIMEOUT = 45.0
+READER_ONLY_STATUS = {403}
+READER_BLOCK_SIGNS = BOT_SIGNS + ("403 forbidden", "403 error", "target url returned error", "error 403",
+                                  "request could not be satisfied", "request blocked",
+                                  "between cloudflare and the origin")
+
+
+def _strategy_reader_proxy(url, fetcher: Fetcher, rule: DomainRule, ctx) -> str:
+    if ctx.get("_first_status") not in READER_ONLY_STATUS:
+        return ""
+    if ctx.get("reader_proxy_used", 0) >= READER_MAX_PER_RUN:
+        ctx["reader_proxy_capped"] = ctx.get("reader_proxy_capped", 0) + 1
+        return ""
+    ctx["reader_proxy_used"] = ctx.get("reader_proxy_used", 0) + 1
+    # 마크다운 기본 응답은 메뉴·속보 목록까지 섞이므로 렌더링된 HTML을 받아 trafilatura로 본문만 뽑는다
+    r = fetcher.get(READER_BASE + url, min_interval=READER_INTERVAL, timeout=READER_TIMEOUT,
+                    headers={"X-Return-Format": "html"})
+    if r.status != 200:
+        return ""
+    text, _ = trafilatura_extract(r.text, url)
+    # 짧은 결과에 차단 문구가 있으면 Jina도 막힌 것 (긴 본문은 head의 recaptcha 등 오탐 방지로 그대로 채택)
+    # 본문 첫머리가 오류 문구면(CloudFront "403 ERROR" 등) 채택하지 않는다
+    if len(text) < PARTIAL_MIN and any(m in r.text[:20000].lower() for m in READER_BLOCK_SIGNS):
+        return ""
+    if any(m in text[:300].lower() for m in READER_BLOCK_SIGNS):
+        return ""
+    return text
+
+
+STRATEGIES = {"amp": _strategy_amp, "feed": _strategy_feed, "presscorner_api": _strategy_presscorner_api,
+              "reader_proxy": _strategy_reader_proxy}
 
 
 def _rss_body(rss_summary: str | None, title: str | None) -> str:
@@ -229,8 +264,11 @@ def extract_body(url: str, fetcher: Fetcher, rules: DomainRules | None = None, *
     if len(best) < PARTIAL_MIN:
         if not rule.skip_fetch:
             res.block_type = classify_block(res.http_status, (r.text or "").lower(), len(best), err_kind)
+        ctx["_first_status"] = res.http_status
         for name in rule.strategies:
             if name in ("og", "rss_summary"):
+                continue
+            if name == "reader_proxy" and res.http_status not in READER_ONLY_STATUS:
                 continue
             res.strategies_tried.append(name)
             try:
