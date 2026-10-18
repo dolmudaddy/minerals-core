@@ -69,8 +69,8 @@ class Prompt:
 def load_prompt(path: str | Path) -> Prompt:
     """--- YAML 머리말 --- 뒤에 '## common', '## mode:body|lead|title', '## output' 절."""
     p = Path(path)
-    raw = p.read_text(encoding="utf-8")
-    m = re.match(r"^---\n(.*?)\n---\n(.*)$", raw.replace("\r\n", "\n"), re.S)
+    raw = p.read_text(encoding="utf-8").replace("\r\n", "\n")   # 줄바꿈 차이(Windows 체크아웃)로 sha가 바뀌지 않게
+    m = re.match(r"^---\n(.*?)\n---\n(.*)$", raw, re.S)
     if not m:
         raise ValueError(f"{p}: YAML 머리말(---)이 없음")
     meta = yaml.safe_load(m.group(1)) or {}

@@ -76,6 +76,12 @@ class Stub:
         return o if isinstance(o, str) else json.dumps(o, ensure_ascii=False)
 
 
+def test_prompt_sha_ignores_crlf(tmp_path, prompt):
+    p = tmp_path / "crlf.md"
+    p.write_bytes(PROMPT.replace("\n", "\r\n").encode("utf-8"))
+    assert load_prompt(p).sha256 == prompt.sha256
+
+
 def test_load_prompt_sections_and_sha(prompt):
     assert prompt.version == "v2.0-test" and len(prompt.sha256) == 64
     assert "3줄 요약" in prompt.system("body") and "3줄 요약" not in prompt.system("title")
