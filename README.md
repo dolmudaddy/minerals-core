@@ -23,7 +23,7 @@ CMW(Critical Minerals Weekly)·KCMO(Korea Critical Minerals ODA Weekly) 공통 �
 
 ## 설치
 ```
-pip install "mincore @ git+https://github.com/dolmudaddy/minerals-core@v0.3.1"
+pip install "mincore @ git+https://github.com/dolmudaddy/minerals-core@v0.3.2"
 # 개발
 pip install -e ".[test]" && pytest
 ```
@@ -50,7 +50,7 @@ CLI: `python -m mincore.ledger {commit,bootstrap,check}`, `python -m mincore.rep
 실패하면 기존대로 og:description → RSS 설명. 채택되면 `body.source == "reader_proxy"`, 실행 보고에 "Reader 프록시 사용 (채택/시도)"가 찍힌다.
 
 ## 요약 (v0.3.0)
-`pip install "mincore[summarize] @ git+https://github.com/dolmudaddy/minerals-core@v0.3.1"` (anthropic 포함).
+`pip install "mincore[summarize] @ git+https://github.com/dolmudaddy/minerals-core@v0.3.2"` (anthropic 포함).
 
 - 지시문은 서비스 저장소 `prompts/summarize_v2.md`: YAML 머리말(`version`, `categories`, `fields`) + `## common` / `## mode:body` / `## mode:lead` / `## mode:title` / `## output` 절.
 - body.status → 모드: full·partial=body(3줄+핵심 수치+인용), lead_only=lead(2줄, 시사점 금지), title_only=title(1줄).

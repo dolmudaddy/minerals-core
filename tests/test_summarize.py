@@ -277,3 +277,17 @@ def test_regen_stops_on_resolve_outage(tmp_path, prompt):
                      extractor=fake_extractor, rules=None, cache_dir=tmp_path / "c", log=logs.append)
     assert done == [] and not (out / "kcmo" / "cards_v2_2026-10-11.json").exists()
     assert any("중단" in m for m in logs)
+
+
+def test_korean_big_unit_conversion_fails(prompt):
+    title = "Bahlil Targetkan Hilirisasi Indonesia Capai 618 Miliar Dolar"
+    out = {"lines": ["바흘릴 장관이 하류산업화 목표를 618억 달러로 설정했음"], "category": "policy_regulation",
+           "tags": ["니켈"], "key_phrases": [], "oda_relevance": "해당 없음"}
+    errs = validate_summary(out, "title", title, prompt)
+    assert any("단위 환산" in e for e in errs)
+    out["lines"] = ["바흘릴 장관이 하류산업화 목표를 618 Miliar 달러로 설정했음"]
+    assert validate_summary(out, "title", title, prompt) == []
+    # 한국어 원문의 '억'은 그대로면 통과
+    ko = "산업부는 1,616억원을 투자한다고 밝혔다"
+    out["lines"] = ["산업부가 희토류 자석 공급망에 1,616억원 투자를 밝혔음"]
+    assert validate_summary(out, "title", ko, prompt) == []
