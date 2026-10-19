@@ -278,6 +278,9 @@ def number_errors(out_text: str, source_text: str, published: str | None = None)
     return errs
 
 
+TRAILING_COMMA = re.compile(r",(\s*[\]}])")
+
+
 def parse_json(text: str) -> dict | None:
     t = (text or "").strip()
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
@@ -285,15 +288,19 @@ def parse_json(text: str) -> dict | None:
         return json.loads(t)
     except ValueError:
         pass
-    # 첫 '{'부터 완결된 객체 하나만 읽는다. JSON 뒤에 붙은 설명문("**주의:** ...")은 무시(Sonnet에서 관찰)
-    i = t.find("{")
-    if i < 0:
-        return None
-    try:
-        obj, _ = json.JSONDecoder().raw_decode(t[i:])
-    except ValueError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    # 객체 시작 후보: 첫 '{'와 줄 첫머리의 '{'. 앞에서부터 완결된 객체 하나만 읽고 뒤 설명문은 무시
+    # (Sonnet 관찰: JSON 뒤 "**주의:** ...", 잘못된 JSON 뒤 "아래가 최종 출력" + 두 번째 JSON)
+    starts = sorted({t.find("{")} | {m.start() for m in re.finditer(r"(?m)^\{", t)} - {-1})
+    dec = json.JSONDecoder()
+    for i in starts:
+        for cand in (t[i:], TRAILING_COMMA.sub(r"\1", t[i:])):   # 배열·객체 끝 쉼표(",\n  ]")만 보정
+            try:
+                obj, _ = dec.raw_decode(cand)
+            except ValueError:
+                continue
+            if isinstance(obj, dict):
+                return obj
+    return None
 
 
 # ── API ──────────────────────────────────────────────────────

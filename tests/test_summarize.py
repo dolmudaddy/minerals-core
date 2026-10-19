@@ -159,6 +159,10 @@ def test_json_failure_causes():
     from mincore.summarize import parse_json
     assert parse_json('{"a": 1}\n\n**주의:** 위 `lines`는 {3줄} 기준임') == {"a": 1}
     assert parse_json('설명 먼저 {"a": {"b": 2}} 끝') == {"a": {"b": 2}}
+    # CMW 관찰: 끝 쉼표, 잘못된 JSON 뒤 두 번째 JSON, 코드식 슬라이스(이건 받지 않음 → 재요청)
+    assert parse_json('{\n  "lines": ["가", "나",\n  ],\n  "x": 1,\n}') == {"lines": ["가", "나"], "x": 1}
+    assert parse_json('{\n "a": 1 "b"\n}\n\n위 출력은 형식이 잘못되었으므로 아래가 최종 출력\n{\n "a": 2\n}') == {"a": 2}
+    assert parse_json('{\n "lines": ["가"].slice(0,3),\n "x": 1\n}') is None
     e = json_failure('{"lines": ["그는 "핵심광물" 협정을 밝혔음"]}')
     assert e.startswith("JSON 파싱 실패: 문법 오류") and "핵심광물" in e
 
