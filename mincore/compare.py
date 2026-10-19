@@ -45,7 +45,8 @@ def write_regen_report(service: str, out_dir: str | Path, *, test_before: str | 
             "flags": s.get("flags", {}), "model_used": s.get("model_used", {}),
             "retry_reason": s.get("retry_reason", {}), "cost_usd": s.get("cost_usd", 0.0),
             "usage": s.get("usage", {}),
-            "week": d["week_of"], "test": bool(test_before and d["week_of"] < test_before),
+            "week": d["week_of"], "test": bool(d.get("trial") or (test_before and d["week_of"] < test_before)),
+            "trial": bool(d.get("trial") or (test_before and d["week_of"] < test_before)),
             "v1_articles": s["v1_articles"], "cards": s["cards"], "excluded": s["excluded"],
             "body_got": s["body_got"], "body_status": s.get("body_status", {}),
             "basis": s.get("basis", {}), "original_link": s.get("original_link", 0),
@@ -117,6 +118,48 @@ def write_regen_report(service: str, out_dir: str | Path, *, test_before: str | 
          "fail_reasons": dict(reasons), "retry_reasons": dict(retry), "flags": dict(flags),
          "line_len": {"lines": len(all_lines), "median": med, "max": max(all_lines, default=None)}}, ensure_ascii=False, indent=1), encoding="utf-8")
     return md
+
+
+def write_rewrite_report(service: str, out_dir: str | Path, field_name: str, n: int = 20, seed: int = 7) -> Path:
+    """재작성 패스 결과: 회차별 교체·유지 수와 비용, 표본 n건 before/after."""
+    import random
+    folder = Path(out_dir) / service
+    rows, pairs, kept = [], [], []
+    for f in sorted(folder.glob("cards_v2_*.json")):
+        d = json.loads(f.read_text(encoding="utf-8"))
+        rw = [r for r in d.get("rewrites") or [] if r.get("field") == field_name]
+        if not rw:
+            continue
+        r = rw[-1]
+        rows.append((d["week_of"], d.get("trial", False), r))
+        kept += [(d["week_of"], k) for k in r.get("kept") or []]
+        for c in d["cards"]:
+            pv = (c.get("provenance") or {}).get("rewrite") or {}
+            if pv.get("field") == field_name and pv.get("prompt_sha256") == r["prompt_sha256"]:
+                pairs.append((d["week_of"], c["title"], pv.get("before"), c["summary"][field_name]))
+    sample = sorted(random.Random(seed).sample(pairs, min(n, len(pairs))))
+    tot = Counter()
+    for _, _, r in rows:
+        tot["targets"] += r["targets"]
+        tot["rewritten"] += r["rewritten"]
+        tot["cost"] += r.get("cost_usd") or 0
+    ver = rows[-1][2]["prompt_version"] if rows else "-"
+    L = [f"# 재작성 패스 — {service.upper()} {field_name} ({ver})", "",
+         f"회차 {len(rows)}개 · 대상 {tot['targets']} · 교체 {tot['rewritten']} · 유지 {len(kept)} · "
+         f"추정 비용 ${tot['cost']:.2f}", "",
+         "| 회차 | 대상 | 교체 | 유지 | 추정 비용 |", "|---|---:|---:|---:|---:|"]
+    L += [f"| {w}{' (시험)' if t else ''} | {r['targets']} | {r['rewritten']} | {len(r.get('kept') or [])} | "
+          f"${r.get('cost_usd') or 0:.2f} |" for w, t, r in rows]
+    L += ["", f"## 표본 {len(sample)}건 (before → after)", ""]
+    for i, (w, title, before, after) in enumerate(sample, 1):
+        L += [f"{i}. **{_cell(title)[:90]}** ({w})", f"   - before: {_cell(before)}",
+              f"   - after: {_cell(after)}", ""]
+    if kept:
+        L += ["## 유지 (교체 실패·본문 없음)", ""]
+        L += [f"- {w} {k['card_id'][:12]}: {_cell(k['reason'])[:150]}" for w, k in kept]
+    p = folder / f"rewrite_report_{field_name}.md"
+    p.write_text("\n".join(L) + "\n", encoding="utf-8")
+    return p
 
 
 def write_review(issue_path: str | Path, md_path: str | Path, golden_path: str | Path, n: int = 30) -> tuple[Path, Path]:

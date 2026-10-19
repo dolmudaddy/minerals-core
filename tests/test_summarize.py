@@ -366,3 +366,66 @@ def test_cmw_implication_field(tmp_path):
     c = card_with("full")
     c["summary"], c["provenance"] = res.summary, res.provenance
     assert to_legacy(c, "cmw", pr)["implication"] == ""
+
+
+# ── v0.3.6: 글자로 쓰인 수, 시험 회차 표시, 시사점 재작성 패스 ──
+
+def test_implied_numbers_month_roman_words(prompt):
+    from mincore.summarize import number_errors
+    src = "Komisi XII DPR said in October that output fell for a decade. Last December talks resumed."
+    assert number_errors("제12위원회는 10월에 밝혔음", src) == []
+    assert number_errors("10년간 감소했고 12월 협상이 재개됐음", src) == []
+    assert any("2025" in e for e in number_errors("2025년 12월 협상이 재개됐음", src))   # '지난해' 계산은 불허
+    assert number_errors("Oktober 발표", "diumumkan pada Oktober") == []
+
+
+REWRITE_PROMPT = PROMPT + """
+## rewrite:oda_relevance
+시사점 문장만 다시 쓴다. JSON {"oda_relevance": "..."}만 출력.
+"""
+
+
+def test_rewrite_pass_replaces_only_field_and_resume(tmp_path, prompt):
+    data, out = tmp_path / "data", tmp_path / "v2"
+    data.mkdir()
+    for w in ("2026-05-14", "2026-10-11"):
+        write_kcmo_v1(data, w)
+    kw = dict(call=lead_or_body_stub, resolver=fake_resolver, extractor=fake_extractor, rules=None,
+              cache_dir=tmp_path / "cache", log=lambda m: None)
+    regen.run("kcmo", data, out, prompt.path, test_before="2026-05-24", **kw)
+    doc = json.loads((out / "kcmo" / "cards_v2_2026-05-14.json").read_text(encoding="utf-8"))
+    assert doc["trial"] is True and doc["cards"][0]["trial"] is True and doc["cards"][0]["legacy"]["trial"] is True
+    # 본문 캐시: fake_extractor는 캐시에 쓰지 않으므로 직접 넣는다
+    (tmp_path / "cache").mkdir(exist_ok=True)
+    sha = doc["cards"][0]["body"]["sha256"]
+    (tmp_path / "cache" / f"{sha}.txt").write_text(BODY, encoding="utf-8")
+
+    p2 = tmp_path / "v22.md"
+    p2.write_text(REWRITE_PROMPT.replace("v2.0-test", "v2.2-test"), encoding="utf-8")
+    calls = []
+
+    def rw_call(model, system, messages, max_tokens):
+        calls.append(messages[0]["content"])
+        if len(calls) == 1:   # 첫 시도는 근거 설명문 → 재요청
+            return json.dumps({"oda_relevance": "POSCO MoU가 본문에 나온다는 점이 협력 근거임"}, ensure_ascii=False)
+        return json.dumps({"oda_relevance": "POSCO의 MoU는 한국 기업의 인도네시아 니켈 공급망 참여 확대를 뜻함"},
+                          ensure_ascii=False)
+
+    done = regen.rewrite("kcmo", out, p2, "oda_relevance", call=rw_call, cache_dir=tmp_path / "cache",
+                         extractor=fake_extractor, rules={}, log=lambda m: None, test_before="2026-05-24")
+    assert done == ["2026-05-14", "2026-10-11"]
+    assert "현재 카드" in calls[0] and "본문(앞부분)" in calls[0]
+    doc2 = json.loads((out / "kcmo" / "cards_v2_2026-05-14.json").read_text(encoding="utf-8"))
+    c0 = doc2["cards"][0]
+    assert c0["summary"]["oda_relevance"].startswith("POSCO의 MoU")
+    assert c0["summary"]["lines"] == doc["cards"][0]["summary"]["lines"]            # 요약은 그대로
+    assert c0["provenance"]["rewrite"]["before"] == doc["cards"][0]["summary"]["oda_relevance"]
+    assert c0["provenance"]["rewrite"]["prompt_version"] == "v2.2-test" and c0["legacy"]["trial"] is True
+    assert doc2["cards"][2]["summary"]["oda_relevance"] == "해당 없음"              # 대상 아님
+    assert doc2["rewrites"][-1]["targets"] == 2
+    # 재개: 같은 지시문으로 다시 돌리면 건너뜀, run --resume도 재작성된 지시문이면 건너뜀
+    assert regen.rewrite("kcmo", out, p2, "oda_relevance", call=rw_call, cache_dir=tmp_path / "cache",
+                         rules={}, log=lambda m: None) == []
+    assert regen.run("kcmo", data, out, p2, resume=True, **kw) == []
+    md = compare.write_rewrite_report("kcmo", out, "oda_relevance").read_text(encoding="utf-8")
+    assert "before:" in md and "(시험)" in md
