@@ -7,6 +7,7 @@ python -m mincore.regen --service kcmo --input data --from 2026-05-13 --to 2026-
 - 입력 v1 파일은 읽기만 한다. 출력은 <out>/<service>/cards_v2_<날짜>.json (회차 단위 → 중단·재개 가능)
 - 본문 전문은 --cache-dir(기본 data/_cache/bodies, gitignore)에만 쓴다
 - 검증 실패 카드는 cards에서 빼고 excluded[]에 사유만 남긴다
+- --resume: 같은 모델·같은 지시문(sha)으로 이미 만든 회차만 건너뛴다. 모델·지시문이 바뀐 회차는 다시 만든다
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import sys
 from collections import Counter
 from datetime import datetime, timezone
@@ -27,7 +29,8 @@ from .extract import BodyResult, _rss_body, extract_body
 from .fetch import Fetcher
 from .normalize import clean_html_text, is_gnews, norm_date
 from .resolve import resolve_many
-from .summarize import DEFAULT_MODEL, Prompt, load_prompt, summarize_card, to_legacy
+from .summarize import (DEFAULT_MODEL, FALLBACK_MODEL, Prompt, estimate_cost, load_prompt, summarize_card,
+                        to_legacy)
 
 # 서비스별 v1 파일 규칙
 PATTERNS = {"kcmo": "cards_*.json", "cmw": "week-*.json"}
@@ -99,11 +102,11 @@ def v1_metrics(service: str, path: Path) -> dict:
 # ── 회차 처리 ────────────────────────────────────────────────
 class Regen:
     def __init__(self, service: str, prompt: Prompt, *, model: str = DEFAULT_MODEL,
-                 cache_dir: str | Path = "data/_cache/bodies", compare_model: str | None = None,
+                 fallback_model: str | None = FALLBACK_MODEL, cache_dir: str | Path = "data/_cache/bodies", compare_model: str | None = None,
                  compare_n: int = 0, call: Callable | None = None, resolver: Callable = resolve_many,
                  extractor: Callable = extract_body, fetcher: Fetcher | None = None, rules=None,
                  log: Callable[[str], None] = print):
-        self.service, self.prompt, self.model = service, prompt, model
+        self.service, self.prompt, self.model, self.fallback_model = service, prompt, model, fallback_model
         self.cache_dir = cache_dir
         self.compare_model, self.compare_left = compare_model, compare_n if compare_model else 0
         self.call, self.resolver, self.extractor = call, resolver, extractor
@@ -132,7 +135,17 @@ class Regen:
             raise ResolveOutage(f"{week}: GN 해석 실패 {len(failed)}/{len(gn)} > {RESOLVE_FAIL_MAX:.0%}")
         ctx: dict = {}
         cards, excluded = [], []
-        st = {k: Counter() for k in ("body_status", "body_source", "resolve", "fail_reason", "basis")}
+        st = {k: Counter() for k in ("body_status", "body_source", "resolve", "fail_reason", "basis",
+                                     "retry_reason", "flags", "model_used")}
+        usage: dict = {}
+        line_lens: list[int] = []
+
+        def add_usage(u):
+            for m, x in u.items():
+                t = usage.setdefault(m, {"calls": 0, "in": 0, "out": 0})
+                for k in t:
+                    t[k] += x.get(k, 0)
+
         for i, (it, r) in enumerate(zip(items, resolutions), 1):
             st["resolve"][r.method] += 1
             body = self._body(it, r, ctx)
@@ -148,24 +161,36 @@ class Regen:
             st["body_status"][card["body"]["status"]] += 1
             st["body_source"][card["body"]["source"]] += 1
             res = summarize_card(card, self.prompt, body_text=body.text,
-                                 rss_summary=clean_html_text(it["summary_raw"]), model=self.model, call=self.call)
+                                 rss_summary=clean_html_text(it["summary_raw"]), model=self.model, call=self.call,
+                                 fallback_model=self.fallback_model)
+            add_usage(res.usage)
+            for x in res.retry_log:
+                for e in x["errors"]:
+                    st["retry_reason"][e.split(" — ")[0][:70]] += 1
             if not res.ok:
                 excluded.append({"card_id": card["card_id"], "title": it["title"], "url": card["url"] or it["url"],
                                  "body_status": card["body"]["status"], "attempts": res.attempts,
-                                 "errors": res.errors})
+                                 "errors": res.errors, "retry_log": res.retry_log})
                 for e in res.errors:
                     st["fail_reason"][e.split(":")[0]] += 1
                 self.log(f"  [{i}/{len(items)}] EXCLUDED {card['body']['status']:<10} {'; '.join(res.errors)[:90]}")
                 continue
             card["summary"], card["provenance"] = res.summary, res.provenance
             st["basis"][res.summary["basis"]] += 1
+            st["model_used"][res.provenance["model"]] += 1
+            for k in res.flags:
+                if k != "primary_errors":
+                    st["flags"][k] += 1
+            line_lens += [len(x) for x in res.summary["lines"]]
             if self.compare_left > 0:
                 self.compare_left -= 1
                 cmp = summarize_card(card, self.prompt, body_text=body.text,
                                      rss_summary=clean_html_text(it["summary_raw"]),
-                                     model=self.compare_model, call=self.call)
+                                     model=self.compare_model, call=self.call, fallback_model=None)
+                add_usage(cmp.usage)
                 card["compare"] = {"model": self.compare_model, "ok": cmp.ok, "summary": cmp.summary,
-                                   "errors": cmp.errors}
+                                   "errors": cmp.errors, "attempts": cmp.attempts,
+                                   "retry_reasons": [e for x in cmp.retry_log for e in x["errors"]][:6]}
             card["v1"] = it["v1"]
             card["legacy"] = to_legacy(card, self.service, self.prompt)
             errs = [e for e in validate(card) if "url" not in e or card["url"]]
@@ -176,6 +201,7 @@ class Regen:
                      f"try={res.attempts} {it['title'][:60]}")
         n = len(items)
         got = st["body_status"]["full"] + st["body_status"]["partial"]
+        oda = [c["summary"].get("oda_relevance") for c in cards if "oda_relevance" in c["summary"]]
         return {
             "schema_version": "card.v1", "service": self.service, "week_of": week,
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -186,6 +212,13 @@ class Regen:
                       "original_link": sum(1 for c in cards if c["url"] and not is_gnews(c["url"]))
                       + sum(1 for e in excluded if e["url"] and not is_gnews(e["url"])),
                       "reader_proxy_used": ctx.get("reader_proxy_used", 0),
+                      "line_len": {"lines": len(line_lens),
+                                   "median": statistics.median(line_lens) if line_lens else None,
+                                   "max": max(line_lens, default=None),
+                                   "over60": sum(x > 60 for x in line_lens),
+                                   "over100": sum(x > 100 for x in line_lens)},
+                      "oda_filled": sum(1 for x in oda if x and x.strip() != "해당 없음"),
+                      "usage": usage, "cost_usd": estimate_cost(usage),
                       **{k: dict(v) for k, v in st.items()}},
             "total": len(cards), "cards": cards, "excluded": excluded,
         }
@@ -204,8 +237,11 @@ def run(service: str, input_dir: str | Path, out_dir: str | Path, prompt_path: s
     for week, path in discover(service, input_dir, date_from, date_to):
         target = out / f"cards_v2_{week}.json"
         if resume and target.exists():
-            rg.log(f"[regen] {week} 이미 있음 → 건너뜀")
-            continue
+            prev = state.get(week) or {}
+            if prev.get("model") == rg.model and prev.get("prompt_sha256") == prompt.sha256:
+                rg.log(f"[regen] {week} 이미 있음(같은 모델·지시문) → 건너뜀")
+                continue
+            rg.log(f"[regen] {week} 모델·지시문이 바뀜({prev.get('model')}, {str(prev.get('prompt_sha256'))[:8]}) → 다시 생성")
         if max_issues is not None and len(done) >= max_issues:
             rg.log(f"[regen] --max-issues {max_issues} 도달 → 중단 (--resume으로 이어서)")
             break
@@ -225,7 +261,8 @@ def run(service: str, input_dir: str | Path, out_dir: str | Path, prompt_path: s
         state_p.write_text(json.dumps(dict(sorted(state.items())), ensure_ascii=False, indent=1), encoding="utf-8")
         s = doc["stats"]
         rg.log(f"[regen] {week} 저장: 카드 {s['cards']}/{s['v1_articles']} · 제외 {s['excluded']} · "
-               f"본문 {s['body_got']}/{s['v1_articles']}")
+               f"본문 {s['body_got']}/{s['v1_articles']} · 줄 중앙값 {s['line_len']['median']} · "
+               f"추정 비용 ${s['cost_usd']}")
         done.append(week)
     return done
 
@@ -241,6 +278,7 @@ def main(argv=None):
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--max-issues", type=int)
     ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--fallback-model", default=FALLBACK_MODEL, help="'none'이면 폴백 안 함")
     ap.add_argument("--compare-model")
     ap.add_argument("--compare-n", type=int, default=0)
     ap.add_argument("--cache-dir", default="data/_cache/bodies")
@@ -249,6 +287,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     done = run(a.service, a.input, a.out, a.prompt, date_from=a.date_from, date_to=a.date_to,
                resume=a.resume, max_issues=a.max_issues, model=a.model, cache_dir=a.cache_dir,
+               fallback_model=None if a.fallback_model in ("", "none") else a.fallback_model,
                compare_model=a.compare_model, compare_n=a.compare_n)
     print(f"[regen] 이번 실행 {len(done)}회차: {', '.join(done) or '-'}")
     if not a.no_report:

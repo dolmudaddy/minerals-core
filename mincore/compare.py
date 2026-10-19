@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,11 +33,18 @@ def _cell(s) -> str:
 
 def write_regen_report(service: str, out_dir: str | Path, *, test_before: str | None = None) -> Path:
     folder = Path(out_dir) / service
-    issues = []
+    issues, all_lines = [], []
     for f in sorted(folder.glob("cards_v2_*.json")):
         d = json.loads(f.read_text(encoding="utf-8"))
         s, v1 = d["stats"], d.get("v1_metrics") or {}
+        lens = [len(x) for c in d["cards"] for x in (c.get("summary") or {}).get("lines") or []]
+        all_lines += lens
         issues.append({
+            "line_median": statistics.median(lens) if lens else None, "line_max": max(lens, default=None),
+            "over100": sum(x > 100 for x in lens), "oda_filled": s.get("oda_filled"),
+            "flags": s.get("flags", {}), "model_used": s.get("model_used", {}),
+            "retry_reason": s.get("retry_reason", {}), "cost_usd": s.get("cost_usd", 0.0),
+            "usage": s.get("usage", {}),
             "week": d["week_of"], "test": bool(test_before and d["week_of"] < test_before),
             "v1_articles": s["v1_articles"], "cards": s["cards"], "excluded": s["excluded"],
             "body_got": s["body_got"], "body_status": s.get("body_status", {}),
@@ -51,14 +59,17 @@ def write_regen_report(service: str, out_dir: str | Path, *, test_before: str | 
             for k in ("v1_articles", "cards", "excluded", "body_got", "original_link",
                       "reader_proxy_used", "v1_original_link", "v1_failed"):
                 t[k] += r[k]
+            t["cost_usd"] += r["cost_usd"] or 0.0
             t["basis_body"] += r["basis"].get("body", 0)
         return t
 
     ops = [r for r in issues if not r["test"]]
     T, O = total(issues), total(ops)
-    reasons = Counter()
+    reasons, retry, flags = Counter(), Counter(), Counter()
     for r in issues:
         reasons.update(r["fail_reason"])
+        retry.update(r["retry_reason"])
+        flags.update(r["flags"])
 
     L = [f"# 재생성 보고 — {service.upper()} v2", "",
          f"생성 {datetime.now(timezone.utc).isoformat(timespec='seconds')} · 회차 {len(issues)}개"
@@ -78,22 +89,33 @@ def write_regen_report(service: str, out_dir: str | Path, *, test_before: str | 
     if test_before and len(ops) != len(issues):
         L += comp_table(f"진단서 비교표 (운영 회차만, {test_before} 이후)", O)
     L += ["## 회차별", "",
-          "| 회차 | 기사 | 카드 | 제외 | 본문 확보 | full | partial | lead | title | 원매체 링크 | Jina |",
-          "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+          "| 회차 | 기사 | 카드 | 제외 | 본문 확보 | full | partial | lead | title | 원매체 링크 | Jina "
+          "| 줄 중앙값/최대 | 100자 초과 | 시사점 | 폴백 | 추정 비용 |",
+          "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for r in issues:
         bs = r["body_status"]
         L.append(f"| {r['week']}{' (시험)' if r['test'] else ''} | {r['v1_articles']} | {r['cards']} | "
                  f"{r['excluded']} | {_pct(r['body_got'], r['v1_articles'])} | "
                  + " | ".join(str(bs.get(s, 0)) for s in STATUSES)
-                 + f" | {r['original_link']} | {r['reader_proxy_used']} |")
-    L += ["", "## 검증 실패 사유 (제외 카드 기준, 마지막 시도)", ""]
+                 + f" | {r['original_link']} | {r['reader_proxy_used']} | {r['line_median']}/{r['line_max']} "
+                 f"| {r['over100']} | {r['oda_filled'] if r['oda_filled'] is not None else '-'} "
+                 f"| {r['flags'].get('fallback_from', 0)} | ${r['cost_usd'] or 0:.2f} |")
+    med = statistics.median(all_lines) if all_lines else None
+    L += ["", f"줄 길이(전체 {len(all_lines)}줄): 중앙값 {med} · 최대 {max(all_lines, default=None)} · "
+          f"60자 초과 {sum(x > 60 for x in all_lines)} · 100자 초과 {sum(x > 100 for x in all_lines)}  ",
+          f"추정 비용 합계 ${T['cost_usd']:.2f} (단가: mincore.summarize.PRICES)  ",
+          f"표시(flags): {dict(flags) or '없음'}", ""]
+    L += ["## 검증 실패 사유 (제외 카드 기준, 마지막 시도)", ""]
     L += [f"- {k}: {v}" for k, v in reasons.most_common()] or ["- 없음"]
+    L += ["", "## 재시도 사유 (모든 실패 시도, 통과한 카드 포함)", ""]
+    L += [f"- {k}: {v}" for k, v in retry.most_common(15)] or ["- 없음"]
     L.append("")
     md = folder / "regen_report.md"
     md.write_text("\n".join(L), encoding="utf-8")
     (folder / "regen_report.json").write_text(json.dumps(
         {"service": service, "issues": issues, "total": dict(T), "operational": dict(O),
-         "fail_reasons": dict(reasons)}, ensure_ascii=False, indent=1), encoding="utf-8")
+         "fail_reasons": dict(reasons), "retry_reasons": dict(retry), "flags": dict(flags),
+         "line_len": {"lines": len(all_lines), "median": med, "max": max(all_lines, default=None)}}, ensure_ascii=False, indent=1), encoding="utf-8")
     return md
 
 

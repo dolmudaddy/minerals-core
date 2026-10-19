@@ -9,7 +9,8 @@ from mincore import compare, regen
 from mincore.card import build_card
 from mincore.extract import BodyResult
 from mincore.resolve import Resolution
-from mincore.summarize import (load_prompt, mode_for, summarize_card, to_legacy, validate_summary)
+from mincore.summarize import (CallOut, estimate_cost, has_korea_evidence, json_failure, load_prompt,
+                               mode_for, summarize_card, to_legacy, validate_summary)
 
 PROMPT = """---
 version: v2.0-test
@@ -146,8 +147,53 @@ def test_lead_mode_blocks_implication_then_retries(prompt):
 
 def test_excluded_after_two_retries(prompt):
     stub = Stub("not json")
-    res = summarize_card(card_with("full"), prompt, body_text=BODY, call=stub)
-    assert not res.ok and res.attempts == 3 and len(stub.calls) == 3 and res.errors == ["JSON 파싱 실패"]
+    res = summarize_card(card_with("full"), prompt, body_text=BODY, call=stub, fallback_model=None)
+    assert not res.ok and res.attempts == 3 and len(stub.calls) == 3
+    assert res.errors[0].startswith("JSON 파싱 실패: JSON 객체 없음")
+
+
+def test_json_failure_causes():
+    assert json_failure("") == "JSON 파싱 실패: 빈 응답"
+    assert "출력 길이 초과" in json_failure('{"lines": ["a', "max_tokens")
+    assert "코드펜스" in json_failure("```json\nnope\n```")
+    e = json_failure('{"lines": ["그는 "핵심광물" 협정을 밝혔음"]}')
+    assert e.startswith("JSON 파싱 실패: 문법 오류") and "핵심광물" in e
+
+
+def test_fallback_model_after_primary_fails(prompt):
+    def call(model, system, messages, max_tokens):
+        if model == "primary":
+            return CallOut("not json", "end_turn", 100, 10)
+        return CallOut(json.dumps(good_body_out(), ensure_ascii=False), "end_turn", 200, 50)
+    res = summarize_card(card_with("full"), prompt, body_text=BODY, call=call, model="primary",
+                         fallback_model="claude-haiku-4-5-20251001")
+    assert res.ok and res.provenance["model"] == "claude-haiku-4-5-20251001" and res.attempts == 4
+    assert res.provenance["flags"]["fallback_from"] == "primary"
+    assert res.usage["primary"] == {"calls": 3, "in": 300, "out": 30}
+    assert estimate_cost(res.usage) == round(200 / 1e6 * 1.0 + 50 / 1e6 * 5.0, 4)
+
+
+def test_soft_line_limit_one_retry_then_pass_flagged(prompt):
+    long = "인도네시아는 2026년 니켈 수출 목표를 USD45 billion으로 제시했으며 생산량은 12% 늘어 " * 2
+    stub = Stub(good_body_out(lines=[long, good_body_out()["lines"][1], good_body_out()["lines"][2]]))
+    res = summarize_card(card_with("full"), prompt, body_text=BODY, call=stub, fallback_model=None)
+    assert res.ok and res.attempts == 2 and "보완 요청" in stub.calls[1]["messages"][-1]["content"]
+    assert res.provenance["flags"]["long_lines"] == 1
+    fixed = Stub(good_body_out(lines=[long, *good_body_out()["lines"][1:]]), good_body_out())
+    res2 = summarize_card(card_with("full"), prompt, body_text=BODY, call=fixed, fallback_model=None)
+    assert res2.ok and "long_lines" not in res2.provenance["flags"]
+
+
+def test_oda_without_korea_evidence_retried_then_forced(prompt):
+    body = BODY.replace("Korea's POSCO signed an MoU with the ministry. ", "")
+    assert not has_korea_evidence(body) and has_korea_evidence(BODY)
+    out = good_body_out(lines=good_body_out()["lines"][:2] + ["부처는 수출 확대 방침을 유지한다고 밝혔음"],
+                        oda_relevance="협력국 니켈 정책 변화는 공급망 협력에 참고가 됨")
+    res = summarize_card(card_with("full"), prompt, body_text=body, call=Stub(out), fallback_model=None)
+    assert res.ok and res.attempts == 2 and res.summary["oda_relevance"] == "해당 없음"
+    assert res.provenance["flags"]["oda_forced"] is True
+    ok = summarize_card(card_with("full"), prompt, body_text=BODY, call=Stub(good_body_out()), fallback_model=None)
+    assert ok.attempts == 1 and "flags" not in ok.provenance
 
 
 def test_title_mode_input_has_no_body(prompt):
@@ -219,6 +265,10 @@ def test_regen_run_resume_and_v1_untouched(tmp_path, prompt):
     assert done == ["2026-10-11"]
     done2 = regen.run("kcmo", data, out, prompt.path, date_from="2026-10-01", resume=True, **kw)
     assert done2 == ["2026-10-18"]
+    # 모델이 바뀌면 --resume이어도 다시 만든다
+    done3 = regen.run("kcmo", data, out, prompt.path, date_from="2026-10-18", resume=True,
+                      **dict(kw, model="other-model"))
+    assert done3 == ["2026-10-18"]
     doc = json.loads((out / "kcmo" / "cards_v2_2026-10-11.json").read_text(encoding="utf-8"))
     assert doc["stats"]["cards"] == 3 and doc["stats"]["body_status"] == {"full": 2, "lead_only": 1}
     assert doc["v1_metrics"] == {"articles": 3, "original_link": 0, "body_based": 0, "failed": 1}
@@ -233,7 +283,7 @@ def test_regen_run_resume_and_v1_untouched(tmp_path, prompt):
     assert before == {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in data.iterdir()}
 
     md = compare.write_regen_report("kcmo", out, test_before="2026-05-24").read_text(encoding="utf-8")
-    assert "진단서 비교표" in md and "| 2026-10-11 |" in md and "4/6 (66.7%)" in md
+    assert "진단서 비교표" in md and "| 2026-10-11 |" in md and "4/6 (66.7%)" in md and "줄 중앙값" in md
     mp, gp = compare.write_review(out / "kcmo" / "cards_v2_2026-10-11.json", tmp_path / "r.md",
                                   tmp_path / "g.json", n=30)
     g = json.loads(gp.read_text(encoding="utf-8"))
@@ -248,7 +298,8 @@ def test_regen_excludes_failed_cards(tmp_path, prompt):
     regen.run("kcmo", data, out, prompt.path, call=lambda *a: "sorry", resolver=fake_resolver,
               extractor=fake_extractor, rules=None, cache_dir=tmp_path / "c", log=lambda m: None)
     doc = json.loads((out / "kcmo" / "cards_v2_2026-10-18.json").read_text(encoding="utf-8"))
-    assert doc["total"] == 0 and len(doc["excluded"]) == 2 and doc["excluded"][0]["attempts"] == 3
+    assert doc["total"] == 0 and len(doc["excluded"]) == 2 and doc["excluded"][0]["attempts"] == 6   # 주+폴백
+    assert {x["model"] for x in doc["excluded"][0]["retry_log"]} == {"claude-sonnet-5-5", "claude-haiku-4-5-20251001"}
     assert doc["stats"]["fail_reason"] == {"JSON 파싱 실패": 2}
 
 
