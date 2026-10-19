@@ -7,7 +7,10 @@ body.status → 모드
   full / partial → body  : 3줄 요약 + 핵심 수치(원문 표기) + 인용(추출 단계 quotes에서 선택)
   lead_only      → lead  : 제목 번역 1줄 + 리드 1줄, 시사점 금지
   title_only     → title : 제목 번역 1줄
-검증 실패 → 실패 사유를 붙여 최대 2회 재요청 → 그래도 실패면 카드 제외(호출하는 쪽이 보고에 기록).
+검증 실패 → 실패 사유를 붙여 최대 2회 재요청 → 그래도 실패면 폴백 모델로 같은 절차 → 그래도 실패면
+카드 제외(호출하는 쪽이 보고에 기록).
+소프트 점검(검증 통과 후): 줄 길이 100자 초과, 입력에 한국 근거가 없는 oda_relevance → 1회 보완 요청.
+보완 뒤에도 줄이 길면 통과시키고 flags에 표시. 근거 없는 oda_relevance는 '해당 없음'으로 고치고 표시.
 """
 
 from __future__ import annotations
@@ -25,8 +28,12 @@ import yaml
 
 from .card import SUMMARY_INPUT_MAX_CHARS
 
-DEFAULT_MODEL = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 1200
+DEFAULT_MODEL = "claude-sonnet-5-5"
+FALLBACK_MODEL = "claude-haiku-4-5-20251001"     # 주 모델이 재시도 후에도 실패할 때만
+MAX_TOKENS = 2048
+LINE_SOFT_MAX = 100
+# 비용 추정용 단가 (USD / 1M 토큰: 입력, 출력). 보고서의 '추정 비용'에만 쓴다
+PRICES = {"claude-sonnet-5-5": (3.0, 15.0), "claude-haiku-4-5-20251001": (1.0, 5.0)}
 VALIDATION_RETRIES = 2
 API_RETRY_WAITS = (5.0, 10.0)
 
@@ -42,6 +49,25 @@ REFUSAL = re.compile(
 NUM = re.compile(r"\d[\d.,]*\d|\d")
 # 한국어 큰 수 단위: 원문에 같은 '숫자+단위'가 없으면 환산으로 본다 (예: 618 miliar → 618억, bilioni moja → 10억)
 KR_UNIT = re.compile(r"(\d[\d.,]*)\s*(만|억|조)")
+# oda_relevance 근거 점검: 입력(제목·본문)에 한국 관련 표기가 하나도 없으면 시사점을 쓸 근거가 없다고 본다
+KOREA_EVIDENCE = re.compile(
+    r"korea|한국|대한민국|韓國|韩国|h[àa]n qu[ốo]c|korsel|солонгос|корея|koreya|ເກົາຫຼີ|seoul|서울|"
+    r"kiat|koica|kigam|komir|kores|kexim|edcf|kotra|kepco|posco|samsung|hyundai|hanwha|lotte|doosan|"
+    r"ecopro|motie|산업통상자원부|산업부|외교부|코이카", re.I)
+KOREA_EVIDENCE_CS = re.compile(r"(?<![A-Za-z])(?:LG|SK|LS)(?![A-Za-z])")
+
+
+def has_korea_evidence(text: str) -> bool:
+    return bool(KOREA_EVIDENCE.search(text or "") or KOREA_EVIDENCE_CS.search(text or ""))
+
+
+def estimate_cost(usage: dict) -> float:
+    """usage = {model: {"calls", "in", "out"}} → 추정 USD (단가표에 없는 모델은 0)."""
+    tot = 0.0
+    for m, u in (usage or {}).items():
+        pi, po = PRICES.get(m, (0.0, 0.0))
+        tot += u.get("in", 0) / 1e6 * pi + u.get("out", 0) / 1e6 * po
+    return round(tot, 4)
 
 
 # ── 지시문 ────────────────────────────────────────────────────
@@ -217,19 +243,56 @@ def parse_json(text: str) -> dict | None:
 
 
 # ── API ──────────────────────────────────────────────────────
-def anthropic_call(model: str, system: str, messages: list[dict], max_tokens: int = MAX_TOKENS) -> str:
+def json_failure(text: str, stop_reason: str | None = None) -> str:
+    """파싱 실패 원인 분류: 빈 응답 / 출력 길이 초과 / JSON 객체 없음 / 문법 오류(위치·주변 문자열)."""
+    t = (text or "").strip()
+    if not t:
+        return "JSON 파싱 실패: 빈 응답"
+    if stop_reason == "max_tokens":
+        return f"JSON 파싱 실패: 출력 길이 초과(max_tokens {MAX_TOKENS}) — 끝: {t[-60:]!r}"
+    fenced = t.startswith("```")
+    t2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
+    m = re.search(r"\{.*\}", t2, re.S)
+    if not m:
+        return "JSON 파싱 실패: JSON 객체 없음" + (" (코드펜스)" if fenced else "") + f" — 앞: {t[:60]!r}"
+    try:
+        json.loads(m.group(0))
+    except ValueError as e:
+        pos = getattr(e, "pos", 0) or 0
+        near = m.group(0)[max(0, pos - 30):pos + 30]
+        return f"JSON 파싱 실패: 문법 오류({getattr(e, 'msg', e)}, 위치 {pos}) — 주변: {near!r}"
+    return "JSON 파싱 실패: 원인 미상"
+
+
+@dataclass
+class CallOut:
+    """API 응답 한 건. 테스트 스텁은 문자열만 돌려줘도 된다(_as_out)."""
+    text: str
+    stop_reason: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+def _as_out(r) -> CallOut:
+    return r if isinstance(r, CallOut) else CallOut(str(r or ""))
+
+
+def anthropic_call(model: str, system: str, messages: list[dict], max_tokens: int = MAX_TOKENS) -> CallOut:
     import anthropic  # 선택 의존성: pip install "mincore[summarize]"
     client = getattr(anthropic_call, "_client", None) or anthropic.Anthropic()
     anthropic_call._client = client
     for i, wait in enumerate((*API_RETRY_WAITS, None)):
         try:
             r = client.messages.create(model=model, max_tokens=max_tokens, system=system, messages=messages)
-            return "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
+            u = getattr(r, "usage", None)
+            return CallOut("".join(b.text for b in r.content if getattr(b, "type", "") == "text"),
+                           getattr(r, "stop_reason", None), getattr(u, "input_tokens", 0) or 0,
+                           getattr(u, "output_tokens", 0) or 0)
         except Exception:
             if wait is None:
                 raise
             time.sleep(wait)
-    return ""
+    return CallOut("")
 
 
 @dataclass
@@ -239,35 +302,111 @@ class SummaryResult:
     provenance: dict | None = None
     errors: list[str] = field(default_factory=list)
     attempts: int = 0
+    usage: dict = field(default_factory=dict)            # {model: {"calls", "in", "out"}}
+    retry_log: list[dict] = field(default_factory=list)  # 실패한 시도: 모델·사유·stop_reason·응답 끝부분
+    flags: dict = field(default_factory=dict)
+
+
+def soft_issues(out: dict, mode: str, source_text: str, prompt: Prompt) -> list[str]:
+    issues = []
+    long = [x for x in out.get("lines") or [] if len(x.strip()) > LINE_SOFT_MAX]
+    if long:
+        issues.append(f"줄 길이 초과: {LINE_SOFT_MAX}자 넘는 줄 {len(long)}개 — 한 줄에 한 가지 사실만 60자 안팎으로")
+    if ("oda_relevance" in prompt.fields and mode == "body"
+            and str(out.get("oda_relevance", "")).strip() != NOT_APPLICABLE
+            and not has_korea_evidence(source_text)):
+        issues.append(f"시사점 근거 없음: 입력에 한국 관련 근거가 없으므로 oda_relevance는 정확히 '{NOT_APPLICABLE}'")
+    return issues
+
+
+def _ask(call, model, system, messages, res: SummaryResult) -> CallOut:
+    r = _as_out(call(model, system, messages, MAX_TOKENS))
+    res.attempts += 1
+    u = res.usage.setdefault(model, {"calls": 0, "in": 0, "out": 0})
+    u["calls"] += 1
+    u["in"] += r.input_tokens
+    u["out"] += r.output_tokens
+    return r
+
+
+def _log_fail(res: SummaryResult, model: str, errors: list[str], r: CallOut | None = None):
+    res.retry_log.append({"model": model, "errors": errors,
+                          "stop_reason": r.stop_reason if r else None,
+                          "out_tokens": r.output_tokens if r else 0,
+                          "tail": (r.text or "")[-160:] if r else ""})
+
+
+def _run_model(model, call, system, user, mode, source_text, prompt, published, retries,
+               res: SummaryResult) -> dict | None:
+    messages = [{"role": "user", "content": user}]
+    out = None
+    for _ in range(retries + 1):
+        try:
+            r = _ask(call, model, system, messages, res)
+        except Exception as e:
+            res.errors = [f"API 오류: {type(e).__name__}: {e}"[:200]]
+            _log_fail(res, model, res.errors)
+            return None
+        out = parse_json(r.text)
+        res.errors = [json_failure(r.text, r.stop_reason)] if out is None else validate_summary(
+            out, mode, source_text, prompt, published)
+        if not res.errors:
+            break
+        _log_fail(res, model, res.errors, r)
+        messages += [{"role": "assistant", "content": r.text or "(빈 응답)"},
+                     {"role": "user", "content": "검증 실패: " + "; ".join(res.errors)
+                      + "\n규칙에 맞게 JSON만 다시 출력하세요. 입력에 없는 내용·숫자는 쓰지 마세요."}]
+        out = None
+    if out is None:
+        return None
+
+    soft = soft_issues(out, mode, source_text, prompt)
+    if soft:                              # 1회 보완 요청. 보완본이 검증을 통과할 때만 바꾼다
+        res.flags["soft_retry"] = [x.split(":")[0] for x in soft]
+        messages += [{"role": "assistant", "content": json.dumps(out, ensure_ascii=False)},
+                     {"role": "user", "content": "보완 요청: " + "; ".join(soft)
+                      + "\n나머지 규칙은 그대로 지켜 JSON만 다시 출력하세요."}]
+        try:
+            r = _ask(call, model, system, messages, res)
+            out2 = parse_json(r.text)
+            errs2 = [json_failure(r.text, r.stop_reason)] if out2 is None else validate_summary(
+                out2, mode, source_text, prompt, published)
+            if errs2:
+                _log_fail(res, model, ["보완본 " + e for e in errs2], r)
+            else:
+                out = out2
+        except Exception as e:
+            _log_fail(res, model, [f"보완본 API 오류: {type(e).__name__}"[:120]])
+        long = [x for x in out["lines"] if len(x.strip()) > LINE_SOFT_MAX]
+        if long:
+            res.flags["long_lines"] = len(long)
+        if any(x.startswith("시사점 근거 없음") for x in soft_issues(out, mode, source_text, prompt)):
+            out["oda_relevance"] = NOT_APPLICABLE
+            res.flags["oda_forced"] = True
+    return out
 
 
 def summarize_card(card: dict, prompt: Prompt, *, body_text: str = "", rss_summary: str | None = None,
                    model: str = DEFAULT_MODEL, call: Callable | None = None,
-                   retries: int = VALIDATION_RETRIES) -> SummaryResult:
+                   retries: int = VALIDATION_RETRIES, fallback_model: str | None = FALLBACK_MODEL) -> SummaryResult:
     call = call or anthropic_call
     mode = mode_for(card)
     user = build_input(card, body_text, rss_summary, mode)
     source_text = "\n".join([card.get("title") or "", body_text if mode != "title" else "",
                              (rss_summary or "") if mode == "lead" else ""])
     system = prompt.system(mode)
-    messages = [{"role": "user", "content": user}]
     res = SummaryResult(ok=False)
-    for attempt in range(retries + 1):
-        res.attempts = attempt + 1
-        try:
-            raw = call(model, system, messages, MAX_TOKENS)
-        except Exception as e:
-            res.errors = [f"API 오류: {type(e).__name__}: {e}"[:200]]
-            break
-        out = parse_json(raw)
-        res.errors = ["JSON 파싱 실패"] if out is None else validate_summary(
-            out, mode, source_text, prompt, card.get("published"))
-        if not res.errors:
-            break
-        messages += [{"role": "assistant", "content": raw or "(빈 응답)"},
-                     {"role": "user", "content": "검증 실패: " + "; ".join(res.errors)
-                      + "\n규칙에 맞게 JSON만 다시 출력하세요. 입력에 없는 내용·숫자는 쓰지 마세요."}]
-    if res.errors:
+    used = model
+    out = _run_model(model, call, system, user, mode, source_text, prompt, card.get("published"), retries, res)
+    if out is None and fallback_model and fallback_model != model:
+        primary_errors = res.errors
+        res.flags = {}
+        out = _run_model(fallback_model, call, system, user, mode, source_text, prompt,
+                         card.get("published"), retries, res)
+        used = fallback_model
+        if out is not None:
+            res.flags.update(fallback_from=model, primary_errors=primary_errors)
+    if out is None:
         return res
 
     summary = {"lines": [x.strip() for x in out["lines"]],
@@ -280,13 +419,17 @@ def summarize_card(card: dict, prompt: Prompt, *, body_text: str = "", rss_summa
         summary[k] = out.get(k)
     if "oda_relevance" in prompt.fields and mode != "body":
         summary["oda_relevance"] = NOT_APPLICABLE
-    res.ok, res.summary = True, summary
+    res.ok, res.summary, res.errors = True, summary, []
     res.provenance = {
-        "model": model, "prompt_file": prompt.path, "prompt_version": prompt.version,
+        "model": used, "prompt_file": prompt.path, "prompt_version": prompt.version,
         "prompt_sha256": prompt.sha256, "input_body_status": (card.get("body") or {}).get("status"),
         "input_chars": min(len(body_text), SUMMARY_INPUT_MAX_CHARS) if mode == "body" else len(body_text),
         "attempts": res.attempts,
         "summarized_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if res.flags:
+        res.provenance["flags"] = res.flags
+    if res.retry_log:
+        res.provenance["retry_reasons"] = [e for x in res.retry_log for e in x["errors"]][:6]
     return res
 
 
