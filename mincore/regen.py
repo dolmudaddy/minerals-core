@@ -8,6 +8,10 @@ python -m mincore.regen --service kcmo --input data --from 2026-05-13 --to 2026-
 - 본문 전문은 --cache-dir(기본 data/_cache/bodies, gitignore)에만 쓴다
 - 검증 실패 카드는 cards에서 빼고 excluded[]에 사유만 남긴다
 - --resume: 같은 모델·같은 지시문(sha)으로 이미 만든 회차만 건너뛴다. 모델·지시문이 바뀐 회차는 다시 만든다
+  (재작성 패스로 그 지시문을 이미 적용한 회차도 건너뛴다)
+- --rewrite-field <필드>: 기존 v2 카드의 그 필드 문장만 새 지시문('## rewrite:<필드>' 절)으로 교체.
+  대상은 값이 '해당 없음'이 아닌 카드. 요약·수치·인용·근거 판정은 그대로. provenance.rewrite에 이전 문장과 지시문 기록
+- --test-before: 그 이전 회차 파일·카드에 trial: true (공개 아카이브·새 vault 생성 시 제외 대상)
 """
 
 from __future__ import annotations
@@ -29,8 +33,8 @@ from .extract import BodyResult, _rss_body, extract_body
 from .fetch import Fetcher
 from .normalize import clean_html_text, is_gnews, norm_date
 from .resolve import resolve_many
-from .summarize import (DEFAULT_MODEL, FALLBACK_MODEL, Prompt, estimate_cost, implication_field, load_prompt,
-                        summarize_card, to_legacy)
+from .summarize import (DEFAULT_MODEL, FALLBACK_MODEL, NOT_APPLICABLE, Prompt, estimate_cost, implication_field,
+                        load_prompt, read_body, rewrite_field, summarize_card, to_legacy)
 
 # 서비스별 v1 파일 규칙
 PATTERNS = {"kcmo": "cards_*.json", "cmw": "week-*.json"}
@@ -97,6 +101,35 @@ def v1_metrics(service: str, path: Path) -> dict:
         failed = sum(1 for a in arts if a.get("ai_processed") is False)
     return {"articles": n, "original_link": sum(1 for a in arts if a.get("url") and not is_gnews(a["url"])),
             "body_based": 0, "failed": failed}
+
+
+def _write(path: Path, doc: dict):
+    path.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _set_trial(doc: dict, trial: bool) -> bool:
+    """회차·카드·legacy에 trial 표시. 바뀌었으면 True."""
+    changed = doc.get("trial") != trial
+    doc["trial"] = trial
+    for c in doc.get("cards") or []:
+        for tgt in (c, c.get("legacy") or {}):
+            if tgt.get("trial") != trial:
+                tgt["trial"] = trial
+                changed = True
+    return changed
+
+
+def mark_trial(service: str, out_dir: str | Path, test_before: str | None) -> list[str]:
+    """이미 만든 v2 회차 파일에 trial 표시를 맞춘다(API 호출 없음, 멱등)."""
+    marked = []
+    if not test_before:
+        return marked
+    for f in sorted((Path(out_dir) / service).glob("cards_v2_*.json")):
+        doc = json.loads(f.read_text(encoding="utf-8"))
+        if _set_trial(doc, doc["week_of"] < test_before):
+            _write(f, doc)
+            marked.append(doc["week_of"])
+    return marked
 
 
 # ── 회차 처리 ────────────────────────────────────────────────
@@ -227,19 +260,21 @@ class Regen:
 
 def run(service: str, input_dir: str | Path, out_dir: str | Path, prompt_path: str | Path, *,
         date_from: str | None = None, date_to: str | None = None, resume: bool = False,
-        max_issues: int | None = None, **kw) -> list[str]:
+        max_issues: int | None = None, test_before: str | None = None, **kw) -> list[str]:
     prompt = load_prompt(prompt_path)
     out = Path(out_dir) / service
     out.mkdir(parents=True, exist_ok=True)
     state_p = out / "regen_state.json"
     state = json.loads(state_p.read_text(encoding="utf-8")) if state_p.exists() else {}
     rg = Regen(service, prompt, **kw)
+    mark_trial(service, out_dir, test_before)
     done = []
     for week, path in discover(service, input_dir, date_from, date_to):
         target = out / f"cards_v2_{week}.json"
         if resume and target.exists():
             prev = state.get(week) or {}
-            if prev.get("model") == rg.model and prev.get("prompt_sha256") == prompt.sha256:
+            shas = {prev.get("prompt_sha256"), (prev.get("rewrite") or {}).get("prompt_sha256")}
+            if prev.get("model") == rg.model and prompt.sha256 in shas:
                 rg.log(f"[regen] {week} 이미 있음(같은 모델·지시문) → 건너뜀")
                 continue
             rg.log(f"[regen] {week} 모델·지시문이 바뀜({prev.get('model')}, {str(prev.get('prompt_sha256'))[:8]}) → 다시 생성")
@@ -255,7 +290,9 @@ def run(service: str, input_dir: str | Path, out_dir: str | Path, prompt_path: s
             break
         doc["v1_file"] = path.name
         doc["v1_metrics"] = v1_metrics(service, path)
-        target.write_text(json.dumps(doc, ensure_ascii=False, indent=1), encoding="utf-8")
+        if test_before:
+            _set_trial(doc, week < test_before)
+        _write(target, doc)
         state[week] = {"done_at": doc["generated_at"], "model": doc["model"],
                        "prompt_version": doc["prompt_version"], "prompt_sha256": doc["prompt_sha256"],
                        "cards": doc["total"], "excluded": len(doc["excluded"])}
@@ -264,6 +301,73 @@ def run(service: str, input_dir: str | Path, out_dir: str | Path, prompt_path: s
         rg.log(f"[regen] {week} 저장: 카드 {s['cards']}/{s['v1_articles']} · 제외 {s['excluded']} · "
                f"본문 {s['body_got']}/{s['v1_articles']} · 줄 중앙값 {s['line_len']['median']} · "
                f"추정 비용 ${s['cost_usd']}")
+        done.append(week)
+    return done
+
+
+def rewrite(service: str, out_dir: str | Path, prompt_path: str | Path, field_name: str, *,
+            date_from: str | None = None, date_to: str | None = None, test_before: str | None = None,
+            model: str = DEFAULT_MODEL, fallback_model: str | None = FALLBACK_MODEL,
+            cache_dir: str | Path = "data/_cache/bodies", call: Callable | None = None,
+            extractor: Callable = extract_body, fetcher: Fetcher | None = None, rules=None,
+            log: Callable[[str], None] = print) -> list[str]:
+    """기존 v2 카드의 field_name 문장만 교체. 같은 지시문으로 이미 재작성한 회차는 건너뛴다(재개 가능)."""
+    prompt = load_prompt(prompt_path)
+    out = Path(out_dir) / service
+    state_p = out / "regen_state.json"
+    state = json.loads(state_p.read_text(encoding="utf-8")) if state_p.exists() else {}
+    mark_trial(service, out_dir, test_before)
+    fetcher, rules = fetcher or Fetcher(), (rules if rules is not None else load_rules())
+    done = []
+    for f in sorted(out.glob("cards_v2_*.json")):
+        doc = json.loads(f.read_text(encoding="utf-8"))
+        week = doc["week_of"]
+        if (date_from and week < date_from) or (date_to and week > date_to):
+            continue
+        if any(r.get("field") == field_name and r.get("prompt_sha256") == prompt.sha256
+               for r in doc.get("rewrites") or []):
+            log(f"[rewrite] {week} 이미 같은 지시문으로 재작성 → 건너뜀")
+            continue
+        targets = [c for c in doc["cards"]
+                   if (c.get("summary") or {}).get(field_name) not in (None, "", NOT_APPLICABLE)]
+        log(f"\n[rewrite] {service} {week}: {field_name} 대상 {len(targets)}/{len(doc['cards'])}")
+        usage, kept, ctx = {}, [], {}
+        for c in targets:
+            body = read_body(cache_dir, (c.get("body") or {}).get("sha256"))
+            if not body and c.get("url"):                       # 캐시에 없으면 다시 추출
+                b = extractor(c["url"], fetcher, rules, title=c["title"], rss_summary="",
+                              cache_dir=cache_dir, ctx=ctx)
+                body = b.text if b.status in ("full", "partial") else ""
+            if not body:
+                kept.append({"card_id": c["card_id"], "reason": "본문 없음"})
+                continue
+            res = rewrite_field(c, prompt, field_name, body_text=body, model=model, call=call,
+                                fallback_model=fallback_model)
+            for m, x in res.usage.items():
+                t = usage.setdefault(m, {"calls": 0, "in": 0, "out": 0})
+                for k in t:
+                    t[k] += x.get(k, 0)
+            if not res.ok:
+                kept.append({"card_id": c["card_id"], "reason": "; ".join(res.errors)[:200]})
+                log(f"  KEPT {c['title'][:60]} — {'; '.join(res.errors)[:80]}")
+                continue
+            c["summary"][field_name] = res.summary[field_name]
+            c.setdefault("provenance", {})["rewrite"] = res.provenance
+            c["legacy"] = to_legacy(c, service, prompt)
+            if c.get("trial"):
+                c["legacy"]["trial"] = True
+            log(f"  OK try={res.attempts} {c['title'][:60]}")
+        entry = {"field": field_name, "prompt_version": prompt.version, "prompt_sha256": prompt.sha256,
+                 "model": model, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 "targets": len(targets), "rewritten": len(targets) - len(kept), "kept": kept,
+                 "usage": usage, "cost_usd": estimate_cost(usage)}
+        doc.setdefault("rewrites", []).append(entry)
+        _write(f, doc)
+        state.setdefault(week, {})["rewrite"] = {"field": field_name, "prompt_version": prompt.version,
+                                                  "prompt_sha256": prompt.sha256, "at": entry["at"]}
+        state_p.write_text(json.dumps(dict(sorted(state.items())), ensure_ascii=False, indent=1), encoding="utf-8")
+        log(f"[rewrite] {week} 저장: 교체 {entry['rewritten']}/{len(targets)} · 유지 {len(kept)} · "
+            f"${entry['cost_usd']}")
         done.append(week)
     return done
 
@@ -285,10 +389,20 @@ def main(argv=None):
     ap.add_argument("--cache-dir", default="data/_cache/bodies")
     ap.add_argument("--test-before", help="이 날짜 이전 회차는 보고서에 '시험 회차'로 표시")
     ap.add_argument("--no-report", action="store_true")
+    ap.add_argument("--rewrite-field", help="이 필드 문장만 재작성하는 패스 (예: oda_relevance)")
     a = ap.parse_args(argv)
+    fb = None if a.fallback_model in ("", "none") else a.fallback_model
+    if a.rewrite_field:
+        done = rewrite(a.service, a.out, a.prompt, a.rewrite_field, date_from=a.date_from, date_to=a.date_to,
+                       test_before=a.test_before, model=a.model, fallback_model=fb, cache_dir=a.cache_dir)
+        print(f"[rewrite] 이번 실행 {len(done)}회차: {', '.join(done) or '-'}")
+        from .compare import write_regen_report, write_rewrite_report
+        print(f"[rewrite] 보고서: {write_rewrite_report(a.service, a.out, a.rewrite_field)}")
+        write_regen_report(a.service, a.out, test_before=a.test_before)
+        return
     done = run(a.service, a.input, a.out, a.prompt, date_from=a.date_from, date_to=a.date_to,
                resume=a.resume, max_issues=a.max_issues, model=a.model, cache_dir=a.cache_dir,
-               fallback_model=None if a.fallback_model in ("", "none") else a.fallback_model,
+               fallback_model=fb, test_before=a.test_before,
                compare_model=a.compare_model, compare_n=a.compare_n)
     print(f"[regen] 이번 실행 {len(done)}회차: {', '.join(done) or '-'}")
     if not a.no_report:

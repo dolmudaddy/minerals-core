@@ -59,6 +59,27 @@ KOREA_EVIDENCE = re.compile(
 KOREA_EVIDENCE_CS = re.compile(r"(?<![A-Za-z])(?:LG|SK|LS)(?![A-Za-z])")
 
 
+# 글자로 쓰인 수 (숫자 대조 허용용). 월: 영·인니·스와힐리·베트남(문자형 없음)·러시아·몽골 키릴은 러시아 어간으로 대부분 커버
+MONTH_WORDS = [(p, i) for i, ps in enumerate([
+    r"january|januari|janv|январ", r"february|februari|февра", r"march|maret|machi|март",
+    r"april|aprili|апрел", r"(?<![a-z])(?:may|mei)(?![a-z])|ма[яй]", r"june|juni|июн", r"july|juli|julai|июл",
+    r"august|agustus|agosti|август", r"september|septemba|сентяб", r"october|oktober|oktoba|октяб",
+    r"november|novemba|нояб", r"december|desember|desemba|декаб"], 1) for p in [ps]]
+NUMBER_WORDS = {"ten": 10, "eleven": 11, "twelve": 12, "dozen": 12, "decade": 10, "sepuluh": 10,
+                "sebelas": 11, "lusin": 12, "kumi": 10, "dekade": 10, "десять": 10, "двенадцать": 12}
+ROMAN = re.compile(r"(?<![A-Za-z])(X{0,3}(?:IX|IV|V?I{0,3}))(?![A-Za-z])")
+
+
+def _roman(s: str) -> int:
+    if not s or len(s) < 2:              # 한 글자(I·V·X)는 영어 단어·약어와 겹쳐 제외
+        return 0
+    val = {"I": 1, "V": 5, "X": 10}
+    tot = 0
+    for a, b in zip(s, s[1:] + " "):
+        tot += -val[a] if b in val and val[b] > val[a] else val[a]
+    return tot
+
+
 def has_korea_evidence(text: str) -> bool:
     return bool(KOREA_EVIDENCE.search(text or "") or KOREA_EVIDENCE_CS.search(text or ""))
 
@@ -218,17 +239,40 @@ def validate_summary(out: dict, mode: str, source_text: str, prompt: Prompt,
     if REFUSAL.search(text_out):
         errs.append("거부·사과 문구 포함")
 
+    errs += number_errors(" ".join(lines + [x for x in figs if isinstance(x, str)] + impl_text),
+                          source_text, published)
+    return errs
+
+
+def _implied_numbers(text: str) -> set[str]:
+    """원문에 글자로 쓰인 수: 월 이름(October→10), 로마 숫자(Komisi XII→12), 수 단어(ten·dozen·decade)."""
+    out = set()
+    low = (text or "").lower()
+    for pat, n in MONTH_WORDS:
+        if re.search(pat, low):
+            out.add(str(n))
+    for w, n in NUMBER_WORDS.items():
+        if re.search(rf"(?<![a-z]){w}(?![a-z])", low):
+            out.add(str(n))
+    for r in ROMAN.findall(text or ""):
+        n = _roman(r)
+        if n:
+            out.add(str(n))
+    return out
+
+
+def number_errors(out_text: str, source_text: str, published: str | None = None) -> list[str]:
+    errs = []
     # 단위 환산: 출력의 '숫자+만/억/조'가 원문에 그대로 없으면 실패 (한국어 원문은 통과)
-    out_all = " ".join(lines + [x for x in figs if isinstance(x, str)] + impl_text)
     src_kr = {(re.sub(r"[.,]", "", n), u) for n, u in KR_UNIT.findall(source_text or "")}
-    conv = [f"{n}{u}" for n, u in KR_UNIT.findall(out_all) if (re.sub(r"[.,]", "", n), u) not in src_kr]
+    conv = [f"{n}{u}" for n, u in KR_UNIT.findall(out_text) if (re.sub(r"[.,]", "", n), u) not in src_kr]
     if conv:
         errs.append(f"단위 환산 의심(만·억·조로 바꾸지 말고 원문 숫자·단위 그대로): {conv[:3]}")
-
-    # 숫자 대조: 출력 숫자(2자리 이상)가 입력에 있어야 함. 발행일의 연·월·일은 허용
-    allowed = _num_keys(source_text) | _num_keys((published or "").replace("-", " "))
-    used = _num_keys(" ".join(lines + [x for x in figs if isinstance(x, str)] + impl_text))
-    missing = sorted(k for k in used if len(k) >= 2 and k not in allowed)
+    # 숫자 대조: 출력 숫자(2자리 이상)가 입력에 있어야 함.
+    # 허용: 발행일의 연·월·일, 원문에 글자로 쓰인 월·로마 숫자·수 단어. '지난해'→2025 같은 계산은 불허
+    allowed = (_num_keys(source_text) | _num_keys((published or "").replace("-", " "))
+               | _implied_numbers(source_text))
+    missing = sorted(k for k in _num_keys(out_text) if len(k) >= 2 and k not in allowed)
     if missing:
         errs.append(f"입력에 없는 숫자: {missing[:5]}")
     return errs
@@ -441,6 +485,77 @@ def summarize_card(card: dict, prompt: Prompt, *, body_text: str = "", rss_summa
         res.provenance["flags"] = res.flags
     if res.retry_log:
         res.provenance["retry_reasons"] = [e for x in res.retry_log for e in x["errors"]][:6]
+        res.provenance["retry_tails"] = [x.get("tail", "") for x in res.retry_log][:4]   # 실패 원인 사후 확인용
+    return res
+
+
+# ── 필드 재작성 패스 (예: 시사점 문장만 v2.2로 교체) ─────────────────
+# 근거 설명문·'확인 불가' 표기 금지. 요약·수치·인용·근거 판정(해당 없음 여부)은 바꾸지 않는다
+REWRITE_BANNED = re.compile(r"확인\s*불가|근거(?:임|가|로|는|이|다)|본문(?:에|상|에서|은|이)|명시되|언급되지\s*않")
+
+
+def rewrite_field(card: dict, prompt: Prompt, field_name: str, *, body_text: str,
+                  model: str = DEFAULT_MODEL, call: Callable | None = None,
+                  retries: int = VALIDATION_RETRIES, fallback_model: str | None = FALLBACK_MODEL) -> SummaryResult:
+    """현재 카드의 field_name 문장만 다시 쓴다. 지시문의 '## rewrite:<field>' 절 사용."""
+    call = call or anthropic_call
+    sec = prompt.sections.get(f"rewrite:{field_name}", "").strip()
+    if not sec:
+        raise ValueError(f"{prompt.path}: '## rewrite:{field_name}' 절이 없음")
+    system = "\n\n".join(x for x in (prompt.sections.get("common", "").strip(), sec) if x)
+    s = card.get("summary") or {}
+    current = {"lines": s.get("lines"), "key_figures": s.get("key_figures"), field_name: s.get(field_name)}
+    user = (build_input(card, body_text, None, "body") + "\n\n현재 카드:\n"
+            + json.dumps(current, ensure_ascii=False, indent=1))
+    source_text = "\n".join([card.get("title") or "", body_text])
+    res = SummaryResult(ok=False)
+    out_val, used = None, None
+    for m in [model] + ([fallback_model] if fallback_model and fallback_model != model else []):
+        messages = [{"role": "user", "content": user}]
+        for _ in range(retries + 1):
+            try:
+                r = _ask(call, m, system, messages, res)
+            except Exception as e:
+                res.errors = [f"API 오류: {type(e).__name__}: {e}"[:200]]
+                _log_fail(res, m, res.errors)
+                break
+            out = parse_json(r.text)
+            if out is None:
+                res.errors = [json_failure(r.text, r.stop_reason)]
+            else:
+                v = out.get(field_name)
+                res.errors = []
+                if not isinstance(v, str) or not v.strip():
+                    res.errors.append(f"{field_name}가 비어 있음")
+                else:
+                    v = v.strip()
+                    if v == NOT_APPLICABLE:
+                        res.errors.append(f"근거 판정은 바꾸지 않음: '{NOT_APPLICABLE}'로 바꾸지 말고 문장만 다시 쓰기")
+                    if REWRITE_BANNED.search(v):
+                        res.errors.append("근거 설명·'확인 불가' 표기 금지: 본문 사실이 주는 의미를 한 문장으로")
+                    if not 20 <= len(v) <= 120:
+                        res.errors.append(f"길이 {len(v)}자 (40~100자)")
+                    if REFUSAL.search(v):
+                        res.errors.append("거부·사과 문구 포함")
+                    res.errors += number_errors(v, source_text, card.get("published"))
+            if not res.errors:
+                out_val, used = v, m
+                break
+            _log_fail(res, m, res.errors, r)
+            messages += [{"role": "assistant", "content": r.text or "(빈 응답)"},
+                         {"role": "user", "content": "검증 실패: " + "; ".join(res.errors) + "\nJSON만 다시 출력하세요."}]
+        if out_val is not None:
+            break
+    if out_val is None:
+        return res
+    res.ok, res.errors = True, []
+    res.summary = {field_name: out_val}
+    res.provenance = {"field": field_name, "model": used, "prompt_file": prompt.path,
+                      "prompt_version": prompt.version, "prompt_sha256": prompt.sha256,
+                      "attempts": res.attempts, "before": s.get(field_name),
+                      "rewritten_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    if used != model:
+        res.provenance["fallback_from"] = model
     return res
 
 
