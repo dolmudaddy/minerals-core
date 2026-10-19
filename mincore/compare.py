@@ -134,7 +134,7 @@ def write_review(issue_path: str | Path, md_path: str | Path, golden_path: str |
                  f"{c['body']['status']} {c['body']['chars']}자 | {_cell(v1.get('korean_summary'))} | "
                  f"{_cell(s.get('lines'))}{' · 수치: ' + _cell(s.get('key_figures')) if s.get('key_figures') else ''} | "
                  f"{_cell(cs.get('lines')) if cmp.get('ok') else _cell(cmp.get('errors')) or '-'} | "
-                 f"{_cell(v1.get('oda_relevance'))} | {_cell(s.get('oda_relevance'))} |")
+                 f"{_cell(v1.get('oda_relevance'))} | {_cell(s.get('oda_relevance', s.get('implication')))} |")
         golden.append({
             "card_id": c["card_id"], "title": c["title"], "url": c.get("url"),
             "body_status": c["body"]["status"], "body_sha256": c["body"]["sha256"],

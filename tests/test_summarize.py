@@ -342,3 +342,24 @@ def test_korean_big_unit_conversion_fails(prompt):
     ko = "산업부는 1,616억원을 투자한다고 밝혔다"
     out["lines"] = ["산업부가 희토류 자석 공급망에 1,616억원 투자를 밝혔음"]
     assert validate_summary(out, "title", ko, prompt) == []
+
+
+def test_cmw_implication_field(tmp_path):
+    p = tmp_path / "cmw.md"
+    p.write_text(PROMPT.replace("service: kcmo", "service: cmw")
+                 .replace("fields: [key_phrases, oda_relevance]", "fields: [english_phrases, implication]"),
+                 encoding="utf-8")
+    pr = load_prompt(p)
+    bad = {"lines": ["인도네시아 니켈 수출 목표 제시했음", "부처는 생산 확대를 밝혔다는 리드임"],
+           "category": "supply_chain_trade", "tags": ["니켈"], "english_phrases": [],
+           "implication": "공급망 재편 신호"}
+    assert any("implication" in e for e in validate_summary(bad, "lead", "Indonesia targets nickel", pr))
+    res = summarize_card(card_with("full"), pr, body_text=BODY.replace("Korea's POSCO", "A firm"),
+                         call=Stub(dict(good_body_out(oda_relevance=None), implication="수출 목표 상향은 니켈 시장 공급 확대 요인임",
+                                        english_phrases=[{"phrase": "nickel exports", "meaning": "니켈 수출"}])),
+                         fallback_model=None)
+    assert res.ok and res.summary["implication"].startswith("수출") and "flags" not in res.provenance
+    res.summary["implication"] = "해당 없음"
+    c = card_with("full")
+    c["summary"], c["provenance"] = res.summary, res.provenance
+    assert to_legacy(c, "cmw", pr)["implication"] == ""

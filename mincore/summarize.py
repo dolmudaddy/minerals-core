@@ -41,6 +41,8 @@ MODE_OF = {"full": "body", "partial": "body", "lead_only": "lead", "title_only":
 LINES_OF = {"body": 3, "lead": 2, "title": 1}
 MIN_LINE = {"body": 15, "lead": 15, "title": 8}
 NOT_APPLICABLE = "해당 없음"
+# 시사점 필드: 본문 근거 있을 때만 쓰고 없으면 '해당 없음'. KCMO oda_relevance(한국 근거 점검 추가), CMW implication
+IMPLICATION_FIELDS = ("oda_relevance", "implication")
 BASIS_LABEL = {"lead": "[본문 미확보] ", "title": "[제목 기반] "}
 
 REFUSAL = re.compile(
@@ -85,7 +87,7 @@ class Prompt:
 
     @property
     def fields(self) -> list[str]:
-        """서비스 고유 출력 필드 (예: key_phrases, oda_relevance / english_phrases)."""
+        """서비스 고유 출력 필드 (예: key_phrases, oda_relevance / english_phrases, implication)."""
         return list(self.meta.get("fields") or [])
 
     def system(self, mode: str) -> str:
@@ -160,6 +162,10 @@ def _ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip().lower()
 
 
+def implication_field(prompt: Prompt) -> str | None:
+    return next((f for f in IMPLICATION_FIELDS if f in prompt.fields), None)
+
+
 def validate_summary(out: dict, mode: str, source_text: str, prompt: Prompt,
                      published: str | None = None) -> list[str]:
     errs = []
@@ -188,12 +194,14 @@ def validate_summary(out: dict, mode: str, source_text: str, prompt: Prompt,
             if not isinstance(v, list) or not all(isinstance(x, dict) and x.get("phrase") for x in v):
                 errs.append(f"{k}는 {{phrase, meaning}} 목록이어야 함")
 
-    if "oda_relevance" in prompt.fields and "oda_relevance" in out:
-        oda = out.get("oda_relevance")
-        if not isinstance(oda, str) or not oda.strip():
-            errs.append("oda_relevance가 비어 있음")
-        elif mode != "body" and oda.strip() != NOT_APPLICABLE:
-            errs.append(f"본문 미확보 카드는 oda_relevance를 '{NOT_APPLICABLE}'로 둬야 함")
+    impl = implication_field(prompt)
+    if impl and impl in out:
+        v = out.get(impl)
+        if not isinstance(v, str) or not v.strip():
+            errs.append(f"{impl}가 비어 있음")
+        elif mode != "body" and v.strip() != NOT_APPLICABLE:
+            errs.append(f"본문 미확보 카드는 {impl}를 '{NOT_APPLICABLE}'로 둬야 함")
+    impl_text = [str(out.get(impl, ""))] if impl else []
 
     figs = out.get("key_figures") or []
     if mode == "body":
@@ -206,12 +214,12 @@ def validate_summary(out: dict, mode: str, source_text: str, prompt: Prompt,
             errs.append(f"key_figures가 원문 표기와 다름(환산·변형 금지): {bad[:3]}")
 
     # 거부·사과 문구 ("확인 불가"는 허용)
-    text_out = " ".join(lines + [str(out.get("oda_relevance", ""))])
+    text_out = " ".join(lines + impl_text)
     if REFUSAL.search(text_out):
         errs.append("거부·사과 문구 포함")
 
     # 단위 환산: 출력의 '숫자+만/억/조'가 원문에 그대로 없으면 실패 (한국어 원문은 통과)
-    out_all = " ".join(lines + [x for x in figs if isinstance(x, str)] + [str(out.get("oda_relevance", ""))])
+    out_all = " ".join(lines + [x for x in figs if isinstance(x, str)] + impl_text)
     src_kr = {(re.sub(r"[.,]", "", n), u) for n, u in KR_UNIT.findall(source_text or "")}
     conv = [f"{n}{u}" for n, u in KR_UNIT.findall(out_all) if (re.sub(r"[.,]", "", n), u) not in src_kr]
     if conv:
@@ -219,8 +227,7 @@ def validate_summary(out: dict, mode: str, source_text: str, prompt: Prompt,
 
     # 숫자 대조: 출력 숫자(2자리 이상)가 입력에 있어야 함. 발행일의 연·월·일은 허용
     allowed = _num_keys(source_text) | _num_keys((published or "").replace("-", " "))
-    used = _num_keys(" ".join(lines + [x for x in figs if isinstance(x, str)]
-                              + [str(out.get("oda_relevance", ""))]))
+    used = _num_keys(" ".join(lines + [x for x in figs if isinstance(x, str)] + impl_text))
     missing = sorted(k for k in used if len(k) >= 2 and k not in allowed)
     if missing:
         errs.append(f"입력에 없는 숫자: {missing[:5]}")
@@ -417,8 +424,9 @@ def summarize_card(card: dict, prompt: Prompt, *, body_text: str = "", rss_summa
                "tags": [t.strip() for t in out.get("tags", [])][:5]}
     for k in prompt.fields:
         summary[k] = out.get(k)
-    if "oda_relevance" in prompt.fields and mode != "body":
-        summary["oda_relevance"] = NOT_APPLICABLE
+    impl = implication_field(prompt)
+    if impl and mode != "body":
+        summary[impl] = NOT_APPLICABLE
     res.ok, res.summary, res.errors = True, summary, []
     res.provenance = {
         "model": used, "prompt_file": prompt.path, "prompt_version": prompt.version,
@@ -471,8 +479,10 @@ def to_legacy(card: dict, service: str, prompt: Prompt) -> dict:
             "processed_at": (card.get("provenance") or {}).get("summarized_at"),
         })
     elif service == "cmw":
+        imp = s.get("implication") or ""
         common.update({
             "summary_raw": ext.get("summary_raw", ""),
             "english_phrases": s.get("english_phrases") or [],
+            "implication": "" if imp.strip() == NOT_APPLICABLE else imp,
         })
     return common
