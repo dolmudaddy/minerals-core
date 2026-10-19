@@ -29,8 +29,8 @@ from .extract import BodyResult, _rss_body, extract_body
 from .fetch import Fetcher
 from .normalize import clean_html_text, is_gnews, norm_date
 from .resolve import resolve_many
-from .summarize import (DEFAULT_MODEL, FALLBACK_MODEL, Prompt, estimate_cost, load_prompt, summarize_card,
-                        to_legacy)
+from .summarize import (DEFAULT_MODEL, FALLBACK_MODEL, Prompt, estimate_cost, implication_field, load_prompt,
+                        summarize_card, to_legacy)
 
 # 서비스별 v1 파일 규칙
 PATTERNS = {"kcmo": "cards_*.json", "cmw": "week-*.json"}
@@ -201,7 +201,8 @@ class Regen:
                      f"try={res.attempts} {it['title'][:60]}")
         n = len(items)
         got = st["body_status"]["full"] + st["body_status"]["partial"]
-        oda = [c["summary"].get("oda_relevance") for c in cards if "oda_relevance" in c["summary"]]
+        impl = implication_field(self.prompt)
+        oda = [c["summary"].get(impl) for c in cards] if impl else []
         return {
             "schema_version": "card.v1", "service": self.service, "week_of": week,
             "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
