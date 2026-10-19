@@ -156,6 +156,9 @@ def test_json_failure_causes():
     assert json_failure("") == "JSON 파싱 실패: 빈 응답"
     assert "출력 길이 초과" in json_failure('{"lines": ["a', "max_tokens")
     assert "코드펜스" in json_failure("```json\nnope\n```")
+    from mincore.summarize import parse_json
+    assert parse_json('{"a": 1}\n\n**주의:** 위 `lines`는 {3줄} 기준임') == {"a": 1}
+    assert parse_json('설명 먼저 {"a": {"b": 2}} 끝') == {"a": {"b": 2}}
     e = json_failure('{"lines": ["그는 "핵심광물" 협정을 밝혔음"]}')
     assert e.startswith("JSON 파싱 실패: 문법 오류") and "핵심광물" in e
 

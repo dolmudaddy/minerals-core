@@ -240,13 +240,16 @@ def parse_json(text: str) -> dict | None:
     try:
         return json.loads(t)
     except ValueError:
-        m = re.search(r"\{.*\}", t, re.S)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except ValueError:
-                return None
-    return None
+        pass
+    # 첫 '{'부터 완결된 객체 하나만 읽는다. JSON 뒤에 붙은 설명문("**주의:** ...")은 무시(Sonnet에서 관찰)
+    i = t.find("{")
+    if i < 0:
+        return None
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(t[i:])
+    except ValueError:
+        return None
+    return obj if isinstance(obj, dict) else None
 
 
 # ── API ──────────────────────────────────────────────────────
@@ -259,14 +262,14 @@ def json_failure(text: str, stop_reason: str | None = None) -> str:
         return f"JSON 파싱 실패: 출력 길이 초과(max_tokens {MAX_TOKENS}) — 끝: {t[-60:]!r}"
     fenced = t.startswith("```")
     t2 = re.sub(r"^```(?:json)?\s*|\s*```$", "", t)
-    m = re.search(r"\{.*\}", t2, re.S)
-    if not m:
+    i = t2.find("{")
+    if i < 0:
         return "JSON 파싱 실패: JSON 객체 없음" + (" (코드펜스)" if fenced else "") + f" — 앞: {t[:60]!r}"
     try:
-        json.loads(m.group(0))
+        json.JSONDecoder().raw_decode(t2[i:])
     except ValueError as e:
         pos = getattr(e, "pos", 0) or 0
-        near = m.group(0)[max(0, pos - 30):pos + 30]
+        near = t2[i:][max(0, pos - 30):pos + 30]
         return f"JSON 파싱 실패: 문법 오류({getattr(e, 'msg', e)}, 위치 {pos}) — 주변: {near!r}"
     return "JSON 파싱 실패: 원인 미상"
 
